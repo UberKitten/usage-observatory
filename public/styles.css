@@ -789,6 +789,7 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
   margin-top: 0.75rem;
   display: grid;
   gap: 0.65rem;
+  align-items: start;
 }
 
 .compact-card {
@@ -798,6 +799,7 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
   grid-template-columns: 1fr auto;
   align-items: baseline;
   gap: 0.12rem 0.75rem;
+  min-height: 4.5rem;
 }
 
 .compact-card > span {
@@ -826,7 +828,7 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
 }
 
 .alerts-control {
-  grid-column: 1 / -1;
+  min-height: 4.5rem;
   padding: 0.8rem 0.9rem;
 }
 
