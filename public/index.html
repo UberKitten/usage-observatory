@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#10071f">
+    <meta name="description" content="OpenAI Codex subscription allowance history and weekly trajectory.">
+    <title>Codex Usage Observatory</title>
+    <link rel="stylesheet" href="/styles.css?v=20260909-live-warp-4">
+  </head>
+  <body data-pace="unknown">
+    <a class="skip-link" href="#main-content">Skip to usage</a>
+
+    <div class="space" aria-hidden="true">
+      <div class="nebula nebula-one"></div>
+      <div class="nebula nebula-two"></div>
+      <div class="starfield" id="starfield"></div>
+      <div class="horizon"></div>
+    </div>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Usage Observatory home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
+            <circle cx="21" cy="21" r="4.5" stroke="currentColor" stroke-width="1.5"></circle>
+            <ellipse cx="21" cy="21" rx="16" ry="6.5" stroke="currentColor" stroke-width="1.5"></ellipse>
+            <ellipse cx="21" cy="21" rx="16" ry="6.5" transform="rotate(60 21 21)" stroke="currentColor" stroke-width="1.5"></ellipse>
+          </svg>
+        </span>
+        <span>
+          <strong>Usage Observatory</strong>
+        </span>
+      </a>
+      <div class="header-status" id="header-status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="header-status-text">Connecting…</span>
+      </div>
+    </header>
+
+    <div class="banner-stack" id="banner-stack" aria-live="assertive" aria-atomic="true"></div>
+
+    <main id="main-content" tabindex="-1">
+      <section class="usage-hero panel" aria-labelledby="usage-title">
+        <div class="hero-primary">
+          <div class="remaining-readout">
+            <strong id="remaining-value">Loading usage…</strong>
+            <span id="remaining-label" hidden>remaining</span>
+          </div>
+          <h1 id="usage-title">Weekly usage</h1>
+          <p class="reset-countdown" id="reset-countdown" hidden></p>
+        </div>
+        <div class="pace-readout" id="pace-readout">
+          <div class="pace-verdict" id="pace-verdict">
+            <span class="pace-icon" id="pace-icon" aria-hidden="true">◇</span>
+            <strong id="pace-text">Unknown</strong>
+          </div>
+          <div class="pace-metrics" id="pace-metrics" aria-label="Pace numbers">
+            <div id="pace-rate-item" hidden>
+              <span>Recent rate</span>
+              <strong id="pace-rate"></strong>
+            </div>
+            <div id="pace-projection-item" hidden>
+              <span>Projected used</span>
+              <strong id="pace-projection"></strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="graph-stack" aria-label="Usage visualizations">
+        <section class="graph-panel panel history-panel" aria-labelledby="history-title">
+          <div class="graph-heading">
+            <div>
+              <h2 id="history-title">Consumption history</h2>
+            </div>
+            <div class="range-picker" id="range-picker" role="group" aria-label="History range">
+              <button type="button" data-range="24h" aria-pressed="true">24h</button>
+              <button type="button" data-range="7d" aria-pressed="false">7d</button>
+              <button type="button" data-range="30d" aria-pressed="false">30d</button>
+              <button type="button" data-range="90d" aria-pressed="false">90d</button>
+              <button type="button" data-range="all" aria-pressed="false">All</button>
+            </div>
+          </div>
+          <div class="series-key" id="history-key" aria-label="History series"></div>
+          <div class="graph-wrap" id="history-wrap" aria-live="polite">
+            <div class="graph-loading" id="history-loading">
+              <span class="spinner" aria-hidden="true"></span>
+              <span>Plotting samples…</span>
+            </div>
+            <svg id="history-chart" class="graph-svg" width="720" height="390" viewBox="0 0 720 390" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="history-svg-title history-svg-description" hidden>
+              <title id="history-svg-title">Percent used history</title>
+              <desc id="history-svg-description">Recorded allowance percentages over the selected range.</desc>
+              <g id="history-grid"></g>
+              <g id="history-series"></g>
+            </svg>
+            <div class="graph-tooltip" id="history-tooltip" role="status" aria-live="polite" hidden></div>
+            <div class="graph-empty" id="history-empty" hidden>
+              <strong>No samples in this range</strong>
+            </div>
+            <div class="graph-empty" id="history-error" hidden>
+              <strong>History unavailable</strong>
+              <button class="secondary-button" id="retry-history" type="button">Retry</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="graph-panel panel weekly-panel" aria-labelledby="weekly-title">
+          <div class="graph-heading">
+            <div>
+              <h2 id="weekly-title">Weekly budget trajectory</h2>
+            </div>
+            <div class="trajectory-key" aria-label="Trajectory series">
+              <span><i class="key-line even"></i>Even budget</span>
+              <span><i class="key-line actual"></i>Actual</span>
+              <span><i class="key-line projected"></i>Projection</span>
+            </div>
+          </div>
+          <div class="graph-wrap" id="weekly-wrap" aria-live="polite">
+            <div class="graph-loading" id="weekly-loading">
+              <span class="spinner" aria-hidden="true"></span>
+              <span>Plotting cycle…</span>
+            </div>
+            <svg id="weekly-chart" class="graph-svg" width="720" height="390" viewBox="0 0 720 390" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="weekly-svg-title weekly-svg-description" hidden>
+              <title id="weekly-svg-title">Weekly actual usage and projection</title>
+              <desc id="weekly-svg-description">Actual recorded points compared with an even budget and a projected path to reset.</desc>
+              <g id="weekly-grid"></g>
+              <g id="weekly-series"></g>
+            </svg>
+            <div class="graph-tooltip" id="weekly-tooltip" role="status" aria-live="polite" hidden></div>
+            <div class="graph-empty" id="weekly-empty" hidden>
+              <strong>Weekly cycle unavailable</strong>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="status-strip" aria-label="Current observatory status">
+        <article class="compact-card panel" id="freshness-card" hidden>
+          <span>Freshness</span>
+          <strong id="freshness-value">Connecting…</strong>
+          <time id="freshness-time" hidden></time>
+        </article>
+        <article class="compact-card panel" id="bank-card" hidden>
+          <span>Banked resets</span>
+          <strong id="bank-count"></strong>
+          <time id="bank-expiry" hidden></time>
+        </article>
+      </section>
+
+      <section class="resets-panel panel" id="resets-panel" aria-labelledby="resets-title" hidden>
+        <h2 id="resets-title">Notable resets</h2>
+        <div class="notable-events" id="notable-events" aria-live="polite"></div>
+      </section>
+
+    </main>
+
+    <script src="/app.js?v=20260909-live-warp-2" defer></script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+services:
+  usage-observatory:
+    image: ${USAGE_OBSERVATORY_IMAGE:-ghcr.io/uberkitten/usage-observatory:latest}
+    container_name: usage-observatory
+    restart: unless-stopped
+    read_only: true
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      PORT: "3000"
+      DB_PATH: /data/usage.sqlite
+      USAGE_SOURCE_MODE: live
+      USAGE_OAUTH_FILE: /data/oauth.json
+      COLLECT_INTERVAL_SECONDS: ${COLLECT_INTERVAL_SECONDS:-300}
+      STALE_AFTER_SECONDS: ${STALE_AFTER_SECONDS:-900}
+      AUTO_REDEEM: ${AUTO_REDEEM:-false}
+      AUTO_REDEEM_HORIZON_HOURS: ${AUTO_REDEEM_HORIZON_HOURS:-12}
+      AUTO_REDEEM_MIN_USED_PERCENT: ${AUTO_REDEEM_MIN_USED_PERCENT:-25}
+    volumes:
+      - ${USAGE_DATA_DIR:-./data}:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"

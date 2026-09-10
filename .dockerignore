@@ -1,0 +1,6 @@
+data
+secrets
+*.sqlite
+*.sqlite-*
+.env
+.DS_Store
