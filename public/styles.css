@@ -793,46 +793,9 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
   text-align: right;
 }
 
-.push-card {
-  align-items: center;
-}
-
-.push-copy {
-  min-width: 0;
-  display: grid;
-  gap: 0.12rem;
-}
-
-.push-copy > span {
-  color: var(--muted);
-  font-size: 0.62rem;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.push-copy strong {
-  text-align: left;
-}
-
-.push-copy small {
-  color: var(--muted-strong);
-  font-size: 0.65rem;
-}
-
-.push-card .secondary-button {
+.push-toggle {
+  justify-self: start;
   white-space: nowrap;
-}
-
-@media (max-width: 420px) {
-  .push-card {
-    grid-template-columns: 1fr;
-  }
-
-  .push-card .secondary-button {
-    width: 100%;
-    margin-top: 0.45rem;
-  }
 }
 
 .resets-panel {

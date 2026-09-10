@@ -46,7 +46,7 @@
     "weekly-loading", "weekly-chart", "weekly-svg-description", "weekly-grid", "weekly-series",
     "weekly-tooltip", "weekly-empty", "freshness-card", "freshness-value",
     "freshness-time", "bank-card", "bank-count", "bank-expiry", "resets-panel",
-    "notable-events", "push-card", "push-status", "push-detail", "push-toggle"
+    "notable-events", "push-toggle"
   ];
   let liveSocket = null;
   let liveReconnectTimer = null;
@@ -239,61 +239,29 @@
     const standalone = window.matchMedia("(display-mode: standalone)").matches ||
       window.navigator.standalone === true;
     if (ios && !standalone) {
-      return {
-        supported: false,
-        status: "Add to Home Screen",
-        detail: "On iPhone or iPad, add this site to the Home Screen, open it there, then enable alerts (iOS/iPadOS 16.4+)."
-      };
+      return { supported: false, tooltip: "Add this site to the Home Screen to enable alerts." };
     }
     if (!window.isSecureContext) {
-      return {
-        supported: false,
-        status: "HTTPS required",
-        detail: "Browser alerts require a secure HTTPS connection."
-      };
+      return { supported: false, tooltip: "Alerts require HTTPS." };
     }
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
-      return {
-        supported: false,
-        status: ios ? "Requires iOS/iPadOS 16.4+" : "Not supported",
-        detail: "This browser does not support standards-based Web Push."
-      };
+      return { supported: false, tooltip: "Alerts are not supported by this browser." };
     }
-    return { supported: true, status: "", detail: "" };
+    return { supported: true, tooltip: "" };
   }
 
-  function renderPushControl(status, detail, action = null) {
-    elements["push-card"].hidden = false;
-    elements["push-status"].textContent = status;
-    elements["push-detail"].textContent = detail;
+  function renderPushControl(action, disabled = false, tooltip = "") {
     const button = elements["push-toggle"];
-    button.hidden = action === null;
-    button.disabled = state.pushBusy;
-    if (action === "enable") button.textContent = "Enable alerts";
-    if (action === "disable") button.textContent = "Disable";
+    const label = action === "disable" ? "Disable alerts" : "Enable alerts";
+    button.textContent = label;
+    button.disabled = state.pushBusy || disabled;
+    button.title = tooltip;
+    button.setAttribute("aria-pressed", action === "disable" ? "true" : "false");
+    button.setAttribute("aria-label", tooltip ? `${label}. ${tooltip}` : label);
   }
 
   function renderCurrentPushControl() {
-    if (Notification.permission === "denied") {
-      renderPushControl(
-        "Blocked in browser settings",
-        "Allow notifications for this site in browser or system settings to enable alerts."
-      );
-      return;
-    }
-    if (state.pushSubscription) {
-      renderPushControl(
-        "Over-budget alerts on",
-        "This browser will be alerted only on a fresh transition from under/on budget to over budget.",
-        "disable"
-      );
-      return;
-    }
-    renderPushControl(
-      "Alerts off",
-      "Enable this browser to get one alert when usage newly crosses over budget.",
-      "enable"
-    );
+    renderPushControl(state.pushSubscription ? "disable" : "enable");
   }
 
   function decodeVapidPublicKey(value) {
@@ -305,22 +273,22 @@
   }
 
   async function initializePushControls() {
-    renderPushControl("Checking support…", "Browser alerts are optional and never request permission on page load.");
+    renderPushControl("enable", true);
     let config;
     try {
       config = await fetchJSON("/api/push/config");
     } catch {
-      renderPushControl("Alerts unavailable", "The browser-alert configuration could not be loaded.");
+      renderPushControl("enable", true, "Alerts are unavailable.");
       return;
     }
     if (config.enabled !== true || typeof config.publicKey !== "string") {
-      renderPushControl("Alerts not configured", "The server operator has not enabled browser alerts.");
+      renderPushControl("enable", true, "Alerts are not configured.");
       return;
     }
     state.pushConfig = config;
     const capability = pushCapability();
     if (!capability.supported) {
-      renderPushControl(capability.status, capability.detail);
+      renderPushControl("enable", true, capability.tooltip);
       return;
     }
 
@@ -346,7 +314,7 @@
       }
       renderCurrentPushControl();
     } catch {
-      renderPushControl("Alerts unavailable", "This browser could not initialize its push service.");
+      renderPushControl("enable", true, "Alerts are unavailable.");
     }
   }
 
@@ -369,7 +337,7 @@
         ? await Notification.requestPermission()
         : Notification.permission;
       if (permission !== "granted") {
-        renderCurrentPushControl();
+        if (permission === "denied") window.alert("Notifications are blocked in browser settings.");
         return;
       }
       const subscription = await state.pushRegistration.pushManager.subscribe({
@@ -385,14 +353,10 @@
       state.pushSubscription = subscription;
       renderCurrentPushControl();
     } catch {
-      renderPushControl(
-        "Alert change failed",
-        "No alert setting was changed. Check the connection and try again.",
-        state.pushSubscription ? "disable" : "enable"
-      );
+      window.alert("Alert setting could not be changed.");
     } finally {
       state.pushBusy = false;
-      elements["push-toggle"].disabled = false;
+      renderCurrentPushControl();
     }
   }
 
