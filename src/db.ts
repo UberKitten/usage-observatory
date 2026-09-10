@@ -5,9 +5,9 @@ import type {
   NormalizedObservation,
   ObservationEvent,
   PaceStatus,
+  PushNotificationState,
+  PushPreferences,
   PushSubscriptionInput,
-  PushTransitionState,
-  RedemptionAudit,
   RedemptionAuditState,
   ResetCredit,
   SourceMode,
@@ -120,6 +120,36 @@ const MIGRATIONS = [
       updated_at TEXT NOT NULL
     );
   `,
+  `
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN over_budget INTEGER NOT NULL DEFAULT 1 CHECK (over_budget IN (0, 1));
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN remaining_25 INTEGER NOT NULL DEFAULT 0 CHECK (remaining_25 IN (0, 1));
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN remaining_15 INTEGER NOT NULL DEFAULT 0 CHECK (remaining_15 IN (0, 1));
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN remaining_5 INTEGER NOT NULL DEFAULT 0 CHECK (remaining_5 IN (0, 1));
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN weekly_reset INTEGER NOT NULL DEFAULT 0 CHECK (weekly_reset IN (0, 1));
+    ALTER TABLE web_push_subscriptions
+      ADD COLUMN unscheduled_reset INTEGER NOT NULL DEFAULT 0 CHECK (unscheduled_reset IN (0, 1));
+
+    CREATE TABLE web_push_notification_state (
+      endpoint TEXT PRIMARY KEY
+        REFERENCES web_push_subscriptions(endpoint) ON DELETE CASCADE,
+      last_observation_id INTEGER NOT NULL
+        REFERENCES observations(id) ON DELETE CASCADE,
+      pace_status TEXT NOT NULL CHECK (
+        pace_status IN ('unknown', 'room_to_spend', 'on_track', 'at_risk', 'exhausted')
+      ),
+      remaining_percent REAL,
+      reset_at TEXT,
+      remaining_25_delivered INTEGER NOT NULL CHECK (remaining_25_delivered IN (0, 1)),
+      remaining_15_delivered INTEGER NOT NULL CHECK (remaining_15_delivered IN (0, 1)),
+      remaining_5_delivered INTEGER NOT NULL CHECK (remaining_5_delivered IN (0, 1)),
+      updated_at TEXT NOT NULL
+    );
+  `,
 ] as const;
 
 interface SourceStatusRow {
@@ -210,11 +240,23 @@ interface PushSubscriptionRow {
   auth: string;
   created_at: string;
   updated_at: string;
+  over_budget: number;
+  remaining_25: number;
+  remaining_15: number;
+  remaining_5: number;
+  weekly_reset: number;
+  unscheduled_reset: number;
 }
 
-interface PushTransitionStateRow {
+interface PushNotificationStateRow {
+  endpoint: string;
   last_observation_id: number;
   pace_status: PaceStatus;
+  remaining_percent: number | null;
+  reset_at: string | null;
+  remaining_25_delivered: number;
+  remaining_15_delivered: number;
+  remaining_5_delivered: number;
   updated_at: string;
 }
 
@@ -932,27 +974,116 @@ export class DatabaseStore {
       )
       .get(observationId)?.present === 1;
   }
+  hasObservationGapBetween(startExclusive: string, endInclusive: string): boolean {
+    return this.database
+      .query<{ present: number }, [string, string]>(
+        `SELECT 1 AS present
+           FROM observation_events
+          WHERE kind = 'observation_gap'
+            AND observed_at > ?
+            AND observed_at <= ?
+          LIMIT 1`,
+      )
+      .get(startExclusive, endInclusive)?.present === 1;
+  }
 
-  upsertPushSubscription(subscription: PushSubscriptionInput, at: string): void {
-    this.database
+  getObservationEvents(observationId: number, windowKey: string): ObservationEvent[] {
+    return this.database
+      .query<EventRow, [number, string]>(
+        `SELECT *
+           FROM observation_events
+          WHERE observation_id = ? AND window_key = ?
+          ORDER BY id`,
+      )
+      .all(observationId, windowKey)
+      .map(mapEvent);
+  }
+
+
+  upsertPushSubscription(subscription: PushSubscriptionInput, at: string): StoredPushSubscription {
+    const preferences = subscription.preferences;
+    if (preferences) {
+      this.database
+        .query(
+          `INSERT INTO web_push_subscriptions(
+             endpoint, expiration_time, p256dh, auth, created_at, updated_at,
+             over_budget, remaining_25, remaining_15, remaining_5,
+             weekly_reset, unscheduled_reset
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(endpoint) DO UPDATE SET
+             expiration_time = excluded.expiration_time,
+             p256dh = excluded.p256dh,
+             auth = excluded.auth,
+             updated_at = excluded.updated_at,
+             over_budget = excluded.over_budget,
+             remaining_25 = excluded.remaining_25,
+             remaining_15 = excluded.remaining_15,
+             remaining_5 = excluded.remaining_5,
+             weekly_reset = excluded.weekly_reset,
+             unscheduled_reset = excluded.unscheduled_reset`,
+        )
+        .run(
+          subscription.endpoint,
+          subscription.expirationTime,
+          subscription.keys.p256dh,
+          subscription.keys.auth,
+          at,
+          at,
+          booleanInteger(preferences.overBudget),
+          booleanInteger(preferences.remaining25),
+          booleanInteger(preferences.remaining15),
+          booleanInteger(preferences.remaining5),
+          booleanInteger(preferences.weeklyReset),
+          booleanInteger(preferences.unscheduledReset),
+        );
+    } else {
+      this.database
+        .query(
+          `INSERT INTO web_push_subscriptions(
+             endpoint, expiration_time, p256dh, auth, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(endpoint) DO UPDATE SET
+             expiration_time = excluded.expiration_time,
+             p256dh = excluded.p256dh,
+             auth = excluded.auth,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          subscription.endpoint,
+          subscription.expirationTime,
+          subscription.keys.p256dh,
+          subscription.keys.auth,
+          at,
+          at,
+        );
+    }
+    return this.getPushSubscription(subscription.endpoint)!;
+  }
+
+  updatePushPreferences(endpoint: string, preferences: PushPreferences, at: string): StoredPushSubscription | null {
+    const changed = this.database
       .query(
-        `INSERT INTO web_push_subscriptions(
-           endpoint, expiration_time, p256dh, auth, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(endpoint) DO UPDATE SET
-           expiration_time = excluded.expiration_time,
-           p256dh = excluded.p256dh,
-           auth = excluded.auth,
-           updated_at = excluded.updated_at`,
+        `UPDATE web_push_subscriptions
+            SET over_budget = ?,
+                remaining_25 = ?,
+                remaining_15 = ?,
+                remaining_5 = ?,
+                weekly_reset = ?,
+                unscheduled_reset = ?,
+                updated_at = ?
+          WHERE endpoint = ?`,
       )
       .run(
-        subscription.endpoint,
-        subscription.expirationTime,
-        subscription.keys.p256dh,
-        subscription.keys.auth,
+        booleanInteger(preferences.overBudget),
+        booleanInteger(preferences.remaining25),
+        booleanInteger(preferences.remaining15),
+        booleanInteger(preferences.remaining5),
+        booleanInteger(preferences.weeklyReset),
+        booleanInteger(preferences.unscheduledReset),
         at,
-        at,
-      );
+        endpoint,
+      ).changes;
+    return changed > 0 ? this.getPushSubscription(endpoint) : null;
   }
 
   deletePushSubscription(endpoint: string): boolean {
@@ -970,6 +1101,19 @@ export class DatabaseStore {
       .run(subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth).changes > 0;
   }
 
+  getPushSubscription(endpoint: string): StoredPushSubscription | null {
+    const row = this.database
+      .query<PushSubscriptionRow, [string]>(
+        `SELECT endpoint, expiration_time, p256dh, auth, created_at, updated_at,
+                over_budget, remaining_25, remaining_15, remaining_5,
+                weekly_reset, unscheduled_reset
+           FROM web_push_subscriptions
+          WHERE endpoint = ?`,
+      )
+      .get(endpoint);
+    return row ? mapPushSubscription(row) : null;
+  }
+
   getPushSubscriptions(nowMilliseconds = Date.now()): StoredPushSubscription[] {
     this.database
       .query(
@@ -979,18 +1123,14 @@ export class DatabaseStore {
       .run(nowMilliseconds);
     return this.database
       .query<PushSubscriptionRow, []>(
-        `SELECT endpoint, expiration_time, p256dh, auth, created_at, updated_at
+        `SELECT endpoint, expiration_time, p256dh, auth, created_at, updated_at,
+                over_budget, remaining_25, remaining_15, remaining_5,
+                weekly_reset, unscheduled_reset
            FROM web_push_subscriptions
           ORDER BY created_at, endpoint`,
       )
       .all()
-      .map((row) => ({
-        endpoint: row.endpoint,
-        expirationTime: row.expiration_time,
-        keys: { p256dh: row.p256dh, auth: row.auth },
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      }));
+      .map(mapPushSubscription);
   }
 
   getPushSubscriptionCount(): number {
@@ -999,35 +1139,48 @@ export class DatabaseStore {
       .get()?.count ?? 0;
   }
 
-  getPushTransitionState(): PushTransitionState | null {
+  getPushNotificationState(endpoint: string): PushNotificationState | null {
     const row = this.database
-      .query<PushTransitionStateRow, []>(
-        `SELECT last_observation_id, pace_status, updated_at
-           FROM web_push_transition_state
-          WHERE singleton = 1`,
+      .query<PushNotificationStateRow, [string]>(
+        `SELECT endpoint, last_observation_id, pace_status, remaining_percent,
+                reset_at, remaining_25_delivered, remaining_15_delivered,
+                remaining_5_delivered, updated_at
+           FROM web_push_notification_state
+          WHERE endpoint = ?`,
       )
-      .get();
-    return row
-      ? {
-          lastObservationId: row.last_observation_id,
-          paceStatus: row.pace_status,
-          updatedAt: row.updated_at,
-        }
-      : null;
+      .get(endpoint);
+    return row ? mapPushNotificationState(row) : null;
   }
 
-  setPushTransitionState(observationId: number, paceStatus: PaceStatus, at: string): void {
+  setPushNotificationState(state: PushNotificationState): void {
     this.database
       .query(
-        `INSERT INTO web_push_transition_state(
-           singleton, last_observation_id, pace_status, updated_at
-         ) VALUES (1, ?, ?, ?)
-         ON CONFLICT(singleton) DO UPDATE SET
+        `INSERT INTO web_push_notification_state(
+           endpoint, last_observation_id, pace_status, remaining_percent,
+           reset_at, remaining_25_delivered, remaining_15_delivered,
+           remaining_5_delivered, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET
            last_observation_id = excluded.last_observation_id,
            pace_status = excluded.pace_status,
+           remaining_percent = excluded.remaining_percent,
+           reset_at = excluded.reset_at,
+           remaining_25_delivered = excluded.remaining_25_delivered,
+           remaining_15_delivered = excluded.remaining_15_delivered,
+           remaining_5_delivered = excluded.remaining_5_delivered,
            updated_at = excluded.updated_at`,
       )
-      .run(observationId, paceStatus, at);
+      .run(
+        state.endpoint,
+        state.lastObservationId,
+        state.paceStatus,
+        state.remainingPercent,
+        state.resetAt,
+        booleanInteger(state.remaining25Delivered),
+        booleanInteger(state.remaining15Delivered),
+        booleanInteger(state.remaining5Delivered),
+        state.updatedAt,
+      );
   }
 
   planRedemption(creditId: string, redeemRequestId: string, plannedAt: string): RedemptionAudit {
@@ -1117,6 +1270,42 @@ export class DatabaseStore {
   }
 }
 
+
+function booleanInteger(value: boolean): number {
+  return value ? 1 : 0;
+}
+
+function mapPushSubscription(row: PushSubscriptionRow): StoredPushSubscription {
+  return {
+    endpoint: row.endpoint,
+    expirationTime: row.expiration_time,
+    keys: { p256dh: row.p256dh, auth: row.auth },
+    preferences: {
+      overBudget: row.over_budget === 1,
+      remaining25: row.remaining_25 === 1,
+      remaining15: row.remaining_15 === 1,
+      remaining5: row.remaining_5 === 1,
+      weeklyReset: row.weekly_reset === 1,
+      unscheduledReset: row.unscheduled_reset === 1,
+    },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapPushNotificationState(row: PushNotificationStateRow): PushNotificationState {
+  return {
+    endpoint: row.endpoint,
+    lastObservationId: row.last_observation_id,
+    paceStatus: row.pace_status,
+    remainingPercent: row.remaining_percent,
+    resetAt: row.reset_at,
+    remaining25Delivered: row.remaining_25_delivered === 1,
+    remaining15Delivered: row.remaining_15_delivered === 1,
+    remaining5Delivered: row.remaining_5_delivered === 1,
+    updatedAt: row.updated_at,
+  };
+}
 
 function mapEvent(row: EventRow): ObservationEvent {
   return {

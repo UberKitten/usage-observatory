@@ -14,6 +14,16 @@
     "30d": 30 * 24 * 60 * 60 * 1000,
     "90d": 90 * 24 * 60 * 60 * 1000
   };
+  const PUSH_PREFERENCE_KEYS = [
+    "overBudget",
+    "remaining25",
+    "remaining15",
+    "remaining5",
+    "weeklyReset",
+    "unscheduledReset"
+  ];
+  const PUSH_DRAFT_STORAGE_KEY = "usage-observatory:alert-preferences";
+
 
   const state = {
     dashboard: null,
@@ -31,6 +41,14 @@
     pushConfig: null,
     pushRegistration: null,
     pushSubscription: null,
+    pushPreferences: {
+      overBudget: true,
+      remaining25: false,
+      remaining15: false,
+      remaining5: false,
+      weeklyReset: false,
+      unscheduledReset: false
+    },
     pushBusy: false
   };
 
@@ -46,7 +64,7 @@
     "weekly-loading", "weekly-chart", "weekly-svg-description", "weekly-grid", "weekly-series",
     "weekly-tooltip", "weekly-empty", "freshness-card", "freshness-value",
     "freshness-time", "bank-card", "bank-count", "bank-expiry", "resets-panel",
-    "notable-events", "push-toggle"
+    "notable-events", "alerts-control", "push-preferences", "push-toggle"
   ];
   let liveSocket = null;
   let liveReconnectTimer = null;
@@ -94,8 +112,19 @@
     const time = timestamp(value);
     if (time === null) return null;
     return new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
       month: "short",
       day: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    }).format(new Date(time));
+  }
+
+  function formatRunoutInstant(value) {
+    const time = timestamp(value);
+    if (time === null) return null;
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
       hour: "numeric",
       minute: "2-digit"
     }).format(new Date(time));
@@ -106,9 +135,6 @@
     const date = new Date(value);
     if (range === "24h") {
       return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
-    }
-    if (range === "7d") {
-      return new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "numeric" }).format(date);
     }
     if (range === "all") {
       return new Intl.DateTimeFormat(undefined, { month: "short", year: "2-digit" }).format(date);
@@ -231,6 +257,53 @@
       body: JSON.stringify(body)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Invalid JSON response");
+    return payload;
+  }
+
+  function validPushPreferences(value) {
+    return value && typeof value === "object" && !Array.isArray(value) &&
+      PUSH_PREFERENCE_KEYS.every((key) => typeof value[key] === "boolean");
+  }
+
+  function normalizedPushPreferences(value) {
+    if (!validPushPreferences(value)) return null;
+    return Object.fromEntries(PUSH_PREFERENCE_KEYS.map((key) => [key, value[key]]));
+  }
+
+  function readPushDraft() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(PUSH_DRAFT_STORAGE_KEY));
+      if (validPushPreferences(stored)) return normalizedPushPreferences(stored);
+    } catch {}
+    return state.pushPreferences;
+  }
+
+  function writePushDraft() {
+    try {
+      localStorage.setItem(PUSH_DRAFT_STORAGE_KEY, JSON.stringify(state.pushPreferences));
+    } catch {}
+  }
+
+  function renderPushPreferences() {
+    for (const input of elements["push-preferences"].querySelectorAll("[data-push-preference]")) {
+      input.checked = state.pushPreferences[input.dataset.pushPreference];
+      input.disabled = state.pushBusy;
+    }
+  }
+
+  function adoptPushPreferences(value) {
+    const preferences = normalizedPushPreferences(value);
+    if (!preferences) throw new Error("Invalid alert preferences");
+    state.pushPreferences = preferences;
+    writePushDraft();
+    renderPushPreferences();
+  }
+
+  function selectedPushPreferences() {
+    return Object.fromEntries([...elements["push-preferences"].querySelectorAll("[data-push-preference]")]
+      .map((input) => [input.dataset.pushPreference, input.checked]));
   }
 
   function pushCapability() {
@@ -273,6 +346,7 @@
   }
 
   async function initializePushControls() {
+    renderPushPreferences();
     renderPushControl("enable", true);
     let config;
     try {
@@ -310,7 +384,8 @@
         return;
       }
       if (state.pushSubscription) {
-        await mutatePush("POST", state.pushSubscription.toJSON());
+        const response = await mutatePush("POST", state.pushSubscription.toJSON());
+        adoptPushPreferences(response.preferences);
       }
       renderCurrentPushControl();
     } catch {
@@ -321,7 +396,8 @@
   async function togglePush() {
     if (state.pushBusy || !state.pushConfig || !state.pushRegistration) return;
     state.pushBusy = true;
-    elements["push-toggle"].disabled = true;
+    renderPushPreferences();
+    renderCurrentPushControl();
     try {
       if (state.pushSubscription) {
         const subscription = state.pushSubscription;
@@ -329,7 +405,6 @@
         const unsubscribed = await subscription.unsubscribe();
         if (!unsubscribed) throw new Error("Browser push subscription remained active.");
         state.pushSubscription = null;
-        renderCurrentPushControl();
         return;
       }
 
@@ -345,17 +420,49 @@
         applicationServerKey: decodeVapidPublicKey(state.pushConfig.publicKey)
       });
       try {
-        await mutatePush("POST", subscription.toJSON());
+        const response = await mutatePush("POST", {
+          ...subscription.toJSON(),
+          preferences: state.pushPreferences
+        });
+        adoptPushPreferences(response.preferences);
       } catch (error) {
         await subscription.unsubscribe().catch(() => {});
         throw error;
       }
       state.pushSubscription = subscription;
-      renderCurrentPushControl();
     } catch {
       window.alert("Alert setting could not be changed.");
     } finally {
       state.pushBusy = false;
+      renderPushPreferences();
+      renderCurrentPushControl();
+    }
+  }
+
+  async function changePushPreference(event) {
+    const input = event.target.closest("[data-push-preference]");
+    if (!input || state.pushBusy) return;
+    const previous = state.pushPreferences;
+    state.pushPreferences = selectedPushPreferences();
+    writePushDraft();
+    if (!state.pushSubscription) return;
+
+    state.pushBusy = true;
+    renderPushPreferences();
+    renderCurrentPushControl();
+    try {
+      const response = await mutatePush("PATCH", {
+        endpoint: state.pushSubscription.endpoint,
+        preferences: state.pushPreferences
+      });
+      adoptPushPreferences(response.preferences);
+    } catch {
+      state.pushPreferences = previous;
+      writePushDraft();
+      window.alert("Alert setting could not be changed.");
+    } finally {
+      state.pushBusy = false;
+      renderPushPreferences();
       renderCurrentPushControl();
     }
   }
@@ -496,15 +603,20 @@
 
     const rate = finiteNumber(pace.recentRatePercentPerHour);
     const projection = finiteNumber(pace.projectedUsedAtReset);
+    const exhaustion = timestamp(pace.projectedExhaustionAt);
+    const hasRunout = exhaustion !== null && resetTime !== null && exhaustion <= resetTime;
     setOptionalMetric(
       elements["pace-rate-item"],
       elements["pace-rate"],
       rate === null ? null : `${formatPercent(rate)} / hour`
     );
+    elements["pace-projection-item"].querySelector("span").textContent = hasRunout ? "Forecast" : "Projected used";
     setOptionalMetric(
       elements["pace-projection-item"],
       elements["pace-projection"],
-      projection === null ? null : formatPercent(projection)
+      hasRunout
+        ? `Runs out ${formatRunoutInstant(exhaustion)}`
+        : projection === null ? null : formatPercent(clamp(projection, 0, 100))
     );
     updateCountdowns();
   }
@@ -697,7 +809,54 @@
     return nodes;
   }
 
+  function calendarTimeGrid(minimum, maximum) {
+    const ticks = new Map();
+    for (const [hour, daily] of [[0, true], [12, false]]) {
+      const cursor = new Date(minimum);
+      cursor.setHours(hour, 0, 0, 0);
+      if (cursor.getTime() < minimum) {
+        cursor.setDate(cursor.getDate() + 1);
+        cursor.setHours(hour, 0, 0, 0);
+      }
+      for (let count = 0; count < 32 && cursor.getTime() <= maximum; count += 1) {
+        ticks.set(cursor.getTime(), daily);
+        cursor.setDate(cursor.getDate() + 1);
+        cursor.setHours(hour, 0, 0, 0);
+      }
+    }
+
+    const dateFormatter = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric"
+    });
+    const nodes = [];
+    for (const [time, daily] of [...ticks].sort(([left], [right]) => left - right)) {
+      const x = xPosition(time, minimum, maximum);
+      nodes.push(createSvg("line", {
+        x1: x,
+        y1: CHART.plot.top,
+        x2: x,
+        y2: CHART.plot.bottom,
+        stroke: daily ? "#443451" : "#2d223c",
+        "stroke-width": daily ? 1.25 : 1,
+        class: "graph-grid-line"
+      }));
+      if (!daily) continue;
+      const label = createSvg("text", {
+        x,
+        y: 367,
+        "text-anchor": x < CHART.plot.left + 35 ? "start" : x > CHART.plot.right - 35 ? "end" : "middle",
+        fill: "#ad9fbe",
+        class: "graph-axis-label calendar-axis-label"
+      });
+      label.textContent = dateFormatter.format(new Date(time));
+      nodes.push(label);
+    }
+    return nodes;
+  }
+
   function timeGrid(minimum, maximum, range) {
+    if (range === "7d") return calendarTimeGrid(minimum, maximum);
     const nodes = [];
     const tickCount = 5;
     for (let index = 0; index < tickCount; index += 1) {
@@ -724,6 +883,25 @@
       nodes.push(label);
     }
     return nodes;
+  }
+
+  function budgetLimit() {
+    const line = createSvg("line", {
+      x1: CHART.plot.left,
+      y1: CHART.plot.top,
+      x2: CHART.plot.right,
+      y2: CHART.plot.top,
+      class: "budget-limit-line",
+      "aria-hidden": "true"
+    });
+    const label = createSvg("text", {
+      x: CHART.plot.right - 7,
+      y: CHART.plot.top + 17,
+      "text-anchor": "end",
+      class: "budget-limit-label"
+    });
+    label.textContent = "100% limit";
+    return [line, label];
   }
 
   function positionTooltip(tooltip, wrap, svg, x, y) {
@@ -886,14 +1064,6 @@
     return [...byTime.values()].sort((left, right) => timestamp(left.observedAt) - timestamp(right.observedAt));
   }
 
-  function weeklyYScale(points, projection) {
-    const values = points.map((point) => finiteNumber(point.usedPercent)).filter((value) => value !== null);
-    if (projection !== null) values.push(projection);
-    const maximumValue = Math.max(100, ...values);
-    const step = maximumValue <= 100 ? 25 : maximumValue <= 200 ? 50 : Math.max(50, Math.ceil(maximumValue / 4 / 25) * 25);
-    return { maximum: Math.ceil(maximumValue / step) * step, step };
-  }
-
   function renderWeeklyChart(dashboard, history) {
     if (state.dashboardLoading && !dashboard) return;
     if (state.historyLoading && !history) return;
@@ -925,16 +1095,15 @@
       return;
     }
 
-    const projection = finiteNumber(dashboard?.pace?.projectedUsedAtReset);
-    const yScale = weeklyYScale(actualPoints, projection);
-    const grid = horizontalGrid(yScale.maximum, yScale.step).concat(timeGrid(start, reset, "7d"));
+    const pace = dashboard?.pace && typeof dashboard.pace === "object" ? dashboard.pace : {};
+    const projection = finiteNumber(pace.projectedUsedAtReset);
+    const exhaustion = timestamp(pace.projectedExhaustionAt);
+    const grid = horizontalGrid(100, 25).concat(calendarTimeGrid(start, reset), budgetLimit());
     replaceChildren(elements["weekly-grid"], grid);
 
     const seriesNodes = [];
-    const evenStartY = yPosition(0, yScale.maximum);
-    const evenResetY = yPosition(100, yScale.maximum);
     seriesNodes.push(createSvg("path", {
-      d: `M${CHART.plot.left},${evenStartY.toFixed(2)} L${CHART.plot.right},${evenResetY.toFixed(2)}`,
+      d: `M${CHART.plot.left},${yPosition(0).toFixed(2)} L${CHART.plot.right},${yPosition(100).toFixed(2)}`,
       fill: "none",
       stroke: "#88799b",
       "stroke-width": 2.5,
@@ -945,7 +1114,7 @@
 
     const actualPath = actualPoints.map((point, index) => {
       const x = xPosition(timestamp(point.observedAt), start, reset);
-      const y = yPosition(finiteNumber(point.usedPercent), yScale.maximum);
+      const y = yPosition(finiteNumber(point.usedPercent));
       return `${index === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
     }).join(" ");
     seriesNodes.push(createSvg("path", {
@@ -959,7 +1128,7 @@
 
     for (const point of actualPoints) {
       const x = xPosition(timestamp(point.observedAt), start, reset);
-      const y = yPosition(finiteNumber(point.usedPercent), yScale.maximum);
+      const y = yPosition(finiteNumber(point.usedPercent));
       const circle = createSvg("circle", {
         cx: x,
         cy: y,
@@ -985,12 +1154,16 @@
 
     const latest = actualPoints.at(-1);
     const latestTime = timestamp(latest.observedAt);
-    if (projection !== null && latestTime < reset) {
+    const runout = exhaustion !== null && exhaustion >= latestTime && exhaustion <= reset ? exhaustion : null;
+    if ((projection !== null || runout !== null) && latestTime < reset) {
+      const endpointTime = runout ?? reset;
+      const endpointUsed = runout === null ? clamp(projection, 0, 100) : 100;
       const startX = xPosition(latestTime, start, reset);
-      const startY = yPosition(finiteNumber(latest.usedPercent), yScale.maximum);
-      const projectionY = yPosition(projection, yScale.maximum);
+      const startY = yPosition(finiteNumber(latest.usedPercent));
+      const endpointX = xPosition(endpointTime, start, reset);
+      const endpointY = yPosition(endpointUsed);
       seriesNodes.push(createSvg("path", {
-        d: `M${startX.toFixed(2)},${startY.toFixed(2)} L${CHART.plot.right},${projectionY.toFixed(2)}`,
+        d: `M${startX.toFixed(2)},${startY.toFixed(2)} L${endpointX.toFixed(2)},${endpointY.toFixed(2)}`,
         fill: "none",
         stroke: "#ffc56f",
         "stroke-width": 3.5,
@@ -999,33 +1172,56 @@
         "aria-hidden": "true"
       }));
       const projectionPoint = createSvg("circle", {
-        cx: CHART.plot.right,
-        cy: projectionY,
-        r: 5.5,
+        cx: endpointX,
+        cy: endpointY,
+        r: runout === null ? 5.5 : 7,
         fill: "#ffc56f",
         stroke: "#140a22",
         "stroke-width": 2.5,
-        class: "projection-point",
+        class: runout === null ? "projection-point" : "projection-point runout-point",
         tabindex: 0,
         role: "img",
-        "aria-label": `Projected, ${formatPercent(projection)} used at reset`
+        "aria-label": runout === null
+          ? `Projected, ${formatPercent(endpointUsed)} used at reset`
+          : `Runs out ${formatRunoutInstant(runout)}`
       });
       bindInteractivePoint(projectionPoint, {
         tooltip: elements["weekly-tooltip"],
         wrap: elements["weekly-wrap"],
         svg: elements["weekly-chart"],
-        x: CHART.plot.right,
-        y: projectionY,
-        content: () => [
-          create("strong", "", `Projected · ${formatPercent(projection)} used`),
-          create("span", "", "At reset")
-        ]
+        x: endpointX,
+        y: endpointY,
+        content: () => runout === null
+          ? [
+              create("strong", "", `Projected · ${formatPercent(endpointUsed)} used`),
+              create("span", "", "At reset")
+            ]
+          : [
+              create("strong", "", "Runs out · 100% used"),
+              create("span", "", formatInstant(runout))
+            ]
       });
       seriesNodes.push(projectionPoint);
+
+      if (runout !== null) {
+        const labelOnRight = endpointX < (CHART.plot.left + CHART.plot.right) / 2;
+        const label = createSvg("text", {
+          x: endpointX + (labelOnRight ? 11 : -11),
+          y: CHART.plot.top + 43,
+          "text-anchor": labelOnRight ? "start" : "end",
+          class: "runout-label",
+          "aria-hidden": "true"
+        });
+        label.textContent = `Runs out ${formatRunoutInstant(runout)}`;
+        seriesNodes.push(label);
+      }
     }
 
     replaceChildren(elements["weekly-series"], seriesNodes);
-    elements["weekly-svg-description"].textContent = `Actual usage and an even budget line${projection === null ? "" : ", with a projection to reset"}.`;
+    const projectionDescription = projection === null && runout === null
+      ? ""
+      : runout === null ? ", with a projection to reset" : ", with a projected runout before reset";
+    elements["weekly-svg-description"].textContent = `Actual usage clipped to a zero-to-one-hundred-percent scale and an even budget line${projectionDescription}.`;
     elements["weekly-chart"].toggleAttribute("hidden", false);
   }
 
@@ -1214,6 +1410,7 @@
     });
     elements["retry-history"].addEventListener("click", loadHistory);
     elements["push-toggle"].addEventListener("click", togglePush);
+    elements["push-preferences"].addEventListener("change", changePushPreference);
     window.addEventListener("offline", () => {
       state.offline = true;
       stopLiveUpdates();
@@ -1242,6 +1439,8 @@
 
   function initialize() {
     cacheElements();
+    state.pushPreferences = readPushDraft();
+    renderPushPreferences();
     setupStarfield();
     bindEvents();
     startClocks();

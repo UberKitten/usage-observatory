@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UsageCollector, normalizeUsagePayload, type CollectorConfig } from "../src/collector";
 import { DatabaseStore } from "../src/db";
-import { createRequestHandler } from "../src/server";
+import { buildPace, createRequestHandler } from "../src/server";
 import type { NormalizedObservation } from "../src/types";
 
 const roots: string[] = [];
@@ -320,6 +320,91 @@ describe("history and pace", () => {
     });
     expect(dashboard.windows[0]?.usedPercent).toBe(10);
     expect(dashboard.pace.status).not.toBe("unknown");
+    store.close();
+  });
+
+  test("projects and dates runout from a trustworthy positive current-rate segment", () => {
+    const store = new DatabaseStore(join(scratch(), "usage.sqlite"));
+    const resetAt = "2026-09-01T03:00:00.000Z";
+    store.insertObservation(
+      observation("2026-09-01T00:00:00.000Z", 70, resetAt),
+      "command",
+      7_200,
+    );
+    store.insertObservation(
+      observation("2026-09-01T01:00:00.000Z", 80, resetAt),
+      "command",
+      7_200,
+    );
+    const latest = store.getLatestObservation()!;
+
+    expect(buildPace(
+      store,
+      latest.windows,
+      "healthy",
+      new Date("2026-09-01T01:00:00.000Z"),
+    )).toMatchObject({
+      recentRatePercentPerHour: 10,
+      projectedUsedAtReset: 100,
+      projectedExhaustionAt: resetAt,
+      basisHours: 1,
+    });
+    store.close();
+  });
+
+  test("reports a trustworthy zero rate without inventing projection or runout", () => {
+    const store = new DatabaseStore(join(scratch(), "usage.sqlite"));
+    const resetAt = "2026-09-08T00:00:00.000Z";
+    store.insertObservation(
+      observation("2026-09-01T00:00:00.000Z", 0, resetAt),
+      "command",
+      7_200,
+    );
+    store.insertObservation(
+      observation("2026-09-01T00:10:00.000Z", 0, resetAt),
+      "command",
+      7_200,
+    );
+    const latest = store.getLatestObservation()!;
+    const result = buildPace(
+      store,
+      latest.windows,
+      "healthy",
+      new Date("2026-09-01T00:10:00.000Z"),
+    );
+
+    expect(result.recentRatePercentPerHour).toBe(0);
+    expect(result.projectedUsedAtReset).toBeNull();
+    expect(result.projectedExhaustionAt).toBeNull();
+    expect(result.basisHours).toBeCloseTo(0.17, 2);
+    store.close();
+  });
+
+  test("rejects a recent-rate basis intersected by an observation gap", () => {
+    const store = new DatabaseStore(join(scratch(), "usage.sqlite"));
+    const resetAt = "2026-09-08T00:00:00.000Z";
+    store.insertObservation(
+      observation("2026-09-01T00:00:00.000Z", 10, resetAt),
+      "command",
+      300,
+    );
+    store.insertObservation(
+      observation("2026-09-01T00:20:00.000Z", 20, resetAt),
+      "command",
+      300,
+    );
+    const latest = store.getLatestObservation()!;
+    const result = buildPace(
+      store,
+      latest.windows,
+      "healthy",
+      new Date("2026-09-01T00:20:00.000Z"),
+    );
+
+    expect(result.recentRatePercentPerHour).toBeNull();
+    expect(result.projectedUsedAtReset).toBeNull();
+    expect(result.projectedExhaustionAt).toBeNull();
+    expect(result.explanation).toContain("observation gap");
     store.close();
   });
 

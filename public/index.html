@@ -8,7 +8,7 @@
     <meta name="description" content="OpenAI Codex subscription allowance history and weekly trajectory.">
     <title>Codex Usage Observatory</title>
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=compact-alerts-1">
+    <link rel="stylesheet" href="/styles.css?v=alerts-2">
   </head>
   <body data-pace="unknown">
     <a class="skip-link" href="#main-content">Skip to usage</a>
@@ -147,7 +147,18 @@
           <strong id="bank-count"></strong>
           <time id="bank-expiry" hidden></time>
         </article>
-        <button class="secondary-button push-toggle" id="push-toggle" type="button" aria-pressed="false" disabled>Enable alerts</button>
+        <details class="alerts-control panel" id="alerts-control">
+          <summary>Alerts</summary>
+          <div class="alert-options" id="push-preferences">
+            <label><input type="checkbox" data-push-preference="overBudget" checked> Over budget</label>
+            <label><input type="checkbox" data-push-preference="remaining25"> 25% remaining</label>
+            <label><input type="checkbox" data-push-preference="remaining15"> 15% remaining</label>
+            <label><input type="checkbox" data-push-preference="remaining5"> 5% remaining</label>
+            <label><input type="checkbox" data-push-preference="weeklyReset"> Weekly reset</label>
+            <label><input type="checkbox" data-push-preference="unscheduledReset"> Unscheduled reset</label>
+          </div>
+          <button class="secondary-button push-toggle" id="push-toggle" type="button" aria-pressed="false" disabled>Enable alerts</button>
+        </details>
       </section>
 
       <section class="resets-panel panel" id="resets-panel" aria-labelledby="resets-title" hidden>
@@ -157,6 +168,6 @@
 
     </main>
 
-    <script src="/app.js?v=compact-alerts-1" defer></script>
+    <script src="/app.js?v=alerts-2" defer></script>
   </body>
 </html>

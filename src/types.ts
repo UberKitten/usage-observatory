@@ -10,6 +10,15 @@ export type SourceState =
 export type PaceStatus = "unknown" | "room_to_spend" | "on_track" | "at_risk" | "exhausted";
 export type EventUncertainty = "low" | "medium" | "high";
 export type RedemptionAuditState = "planned" | "in_flight" | "final" | "ambiguous";
+export interface PushPreferences {
+  overBudget: boolean;
+  remaining25: boolean;
+  remaining15: boolean;
+  remaining5: boolean;
+  weeklyReset: boolean;
+  unscheduledReset: boolean;
+}
+
 
 export interface PushSubscriptionInput {
   endpoint: string;
@@ -18,18 +27,33 @@ export interface PushSubscriptionInput {
     p256dh: string;
     auth: string;
   };
+  preferences?: PushPreferences;
 }
 
-export interface StoredPushSubscription extends PushSubscriptionInput {
+export interface StoredPushSubscription extends Omit<PushSubscriptionInput, "preferences"> {
+  preferences: PushPreferences;
   createdAt: string;
   updatedAt: string;
 }
 
-export interface PushTransitionState {
+export interface PushNotificationState {
+  endpoint: string;
   lastObservationId: number;
   paceStatus: PaceStatus;
+  remainingPercent: number | null;
+  resetAt: string | null;
+  remaining25Delivered: boolean;
+  remaining15Delivered: boolean;
+  remaining5Delivered: boolean;
   updatedAt: string;
 }
+
+export type PushNotificationPayload =
+  | { type: "overBudget"; projectedPercent: number | null }
+  | { type: "remaining"; thresholds: Array<25 | 15 | 5>; remainingPercent: number }
+  | { type: "weeklyReset" }
+  | { type: "unscheduledReset" };
+
 
 export interface AccountSummary {
   planType: string | null;

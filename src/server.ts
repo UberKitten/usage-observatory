@@ -336,10 +336,6 @@ export function buildPace(
 
   const expectedUsedPercent = (elapsedSeconds / window.windowSeconds) * 100;
   const ratio = expectedUsedPercent > 0 ? roundTo(window.usedPercent / expectedUsedPercent, 2) : null;
-  const elapsedHours = elapsedSeconds / 3_600;
-  const totalWindowHours = window.windowSeconds / 3_600;
-  const cycleRate = window.usedPercent / elapsedHours;
-  const projectedUsed = cycleRate * totalWindowHours;
   let status: PaceSummary["status"] =
     ratio !== null && ratio < 0.9 ? "room_to_spend" : ratio !== null && ratio <= 1.05 ? "on_track" : "at_risk";
   if (window.usedPercent >= 100) status = "exhausted";
@@ -356,26 +352,46 @@ export function buildPace(
   const last = points.at(-1);
   let recentRate: number | null = null;
   let recentBasisHours: number | null = null;
+  let gapIntersectsBasis = false;
   if (first && last) {
     const candidateBasis = (Date.parse(last.observedAt) - Date.parse(first.observedAt)) / 3_600_000;
     if (Number.isFinite(candidateBasis) && candidateBasis >= 5 / 60) {
-      recentBasisHours = candidateBasis;
-      recentRate = Math.max(0, (last.usedPercent - first.usedPercent) / candidateBasis);
+      gapIntersectsBasis = store.hasObservationGapBetween(first.observedAt, last.observedAt);
+      if (!gapIntersectsBasis) {
+        recentBasisHours = candidateBasis;
+        recentRate = Math.max(0, (last.usedPercent - first.usedPercent) / candidateBasis);
+      }
     }
   }
 
-  const hoursToExhaustion = cycleRate > 0 ? (100 - window.usedPercent) / cycleRate : null;
+  const projectedUsed =
+    recentRate !== null && recentRate > 0
+      ? window.usedPercent + recentRate * remainingHours
+      : null;
+  const hoursToExhaustion =
+    recentRate !== null && recentRate > 0
+      ? Math.max(0, (100 - window.usedPercent) / recentRate)
+      : null;
   const projectedExhaustionAt =
-    hoursToExhaustion !== null && hoursToExhaustion >= 0 && hoursToExhaustion <= remainingHours
+    hoursToExhaustion !== null && hoursToExhaustion <= remainingHours
       ? new Date(observedMilliseconds + hoursToExhaustion * 3_600_000).toISOString()
       : null;
   const roundedRate = recentRate === null ? null : roundTo(recentRate, 2);
-  const roundedProjection = roundTo(projectedUsed, 1);
-  const roundedBasis = roundTo(elapsedHours, 2);
-  const recentExplanation =
-    roundedRate === null || recentBasisHours === null
-      ? "The recent local rate needs at least five minutes of same-cycle observations."
-      : `The recent local rate is ${roundedRate}% per hour across ${roundTo(recentBasisHours, 2)} hours.`;
+  const roundedProjection = projectedUsed === null ? null : roundTo(projectedUsed, 1);
+  const roundedBasis = recentBasisHours === null ? null : roundTo(recentBasisHours, 2);
+  let forecastExplanation: string;
+  if (gapIntersectsBasis) {
+    forecastExplanation = "The current-trend forecast is unavailable because an observation gap intersects its recent basis.";
+  } else if (roundedRate === null || roundedBasis === null) {
+    forecastExplanation =
+      "The current-trend forecast needs at least five minutes of recent observations from this same reset cycle.";
+  } else if (recentRate === 0) {
+    forecastExplanation =
+      `Recent usage was flat across ${roundedBasis} hours, so no runout projection is inferred.`;
+  } else {
+    forecastExplanation =
+      `The recent rate is ${roundedRate}% per hour across ${roundedBasis} hours, projecting ${roundedProjection}% used at reset.`;
+  }
   return {
     status,
     ratio,
@@ -383,7 +399,7 @@ export function buildPace(
     projectedUsedAtReset: roundedProjection,
     projectedExhaustionAt,
     basisHours: roundedBasis,
-    explanation: `Cycle-to-date projection uses ${roundedBasis} hours since the reported ${window.label} window began: ${roundTo(window.usedPercent, 1)}% observed versus ${roundTo(expectedUsedPercent, 1)}% at an even pace, projecting ${roundedProjection}% by reset. ${recentExplanation} It is an interval estimate, not a provider guarantee.`,
+    explanation: `${roundTo(window.usedPercent, 1)}% is currently used versus ${roundTo(expectedUsedPercent, 1)}% at an even cycle pace. ${forecastExplanation} It is an interval estimate, not a provider guarantee.`,
   };
 }
 

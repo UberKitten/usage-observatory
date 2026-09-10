@@ -7,14 +7,43 @@ self.addEventListener("push", (event) => {
   } catch {
     return;
   }
-  if (!payload || payload.status !== "at_risk") return;
-  const projected = Number(payload.projectedPercent);
-  const body = Number.isFinite(projected)
-    ? `Projected ${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(projected)}% used by reset.`
-    : "Current usage is projected to finish over budget.";
-  event.waitUntil(self.registration.showNotification("Usage over budget", {
+  if (!payload || typeof payload !== "object") return;
+
+  let title;
+  let body;
+  let tag;
+  if (payload.type === "overBudget") {
+    const projected = payload.projectedPercent === null ? NaN : Number(payload.projectedPercent);
+    title = "Usage over budget";
+    body = Number.isFinite(projected)
+      ? `Projected ${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(projected)}% used by reset.`
+      : "Current usage is over budget.";
+    tag = "usage-over-budget";
+  } else if (payload.type === "remaining") {
+    const remaining = payload.remainingPercent === null ? NaN : Number(payload.remainingPercent);
+    const suppliedThresholds = Array.isArray(payload.thresholds) ? payload.thresholds : [];
+    const thresholds = [25, 15, 5].filter((value) => suppliedThresholds.includes(value));
+    if (!Number.isFinite(remaining) || !thresholds.length) return;
+    const crossed = new Intl.ListFormat(undefined, { style: "short", type: "conjunction" })
+      .format(thresholds.map((value) => `${value}%`));
+    title = "Usage running low";
+    body = `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(remaining)}% remaining · crossed ${crossed}.`;
+    tag = "usage-remaining";
+  } else if (payload.type === "weeklyReset") {
+    title = "Weekly usage reset";
+    body = "Weekly allowance has reset.";
+    tag = "usage-weekly-reset";
+  } else if (payload.type === "unscheduledReset") {
+    title = "Unscheduled usage reset";
+    body = "Allowance reset earlier than scheduled.";
+    tag = "usage-unscheduled-reset";
+  } else {
+    return;
+  }
+
+  event.waitUntil(self.registration.showNotification(title, {
     body,
-    tag: "usage-at-risk",
+    tag,
     renotify: true,
     data: { url: "/" },
   }));

@@ -4,10 +4,15 @@ import webPush from "web-push";
 import type { DatabaseStore } from "./db";
 import type {
   CollectionResult,
+  ObservationEvent,
   PaceStatus,
   PaceSummary,
+  PushNotificationPayload,
+  PushNotificationState,
+  PushPreferences,
   PushSubscriptionInput,
   StoredPushSubscription,
+  UsageWindow,
 } from "./types";
 
 const MAX_VAPID_FILE_BYTES = 4_096;
@@ -15,6 +20,8 @@ const MAX_PUSH_JSON_BYTES = 8_192;
 const MAX_ENDPOINT_LENGTH = 4_096;
 const PUSH_TIMEOUT_MILLISECONDS = 5_000;
 const TRANSIENT_RETRY_DELAY_MILLISECONDS = 250;
+const WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+const SCHEDULED_RESET_TOLERANCE_MILLISECONDS = 10 * 60 * 1_000;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const SAFE_PACE_BASELINES: Partial<Record<PaceStatus, true>> = {
   room_to_spend: true,
@@ -29,6 +36,15 @@ const EXACT_PUSH_HOSTS: Record<string, true> = {
   "push.services.mozilla.com": true,
   "updates.push.services.mozilla.com": true,
 };
+export const DEFAULT_PUSH_PREFERENCES: PushPreferences = {
+  overBudget: true,
+  remaining25: false,
+  remaining15: false,
+  remaining5: false,
+  weeklyReset: false,
+  unscheduledReset: false,
+};
+
 
 export interface VapidConfiguration {
   subject: string;
@@ -152,7 +168,7 @@ export function parsePushSubscription(input: unknown): PushSubscriptionInput {
     throw new Error("Invalid push subscription.");
   }
   const value = input as Record<string, unknown>;
-  if (!hasOnlyKeys(value, ["endpoint", "expirationTime", "keys"])) {
+  if (!hasOnlyKeys(value, ["endpoint", "expirationTime", "keys", "preferences"])) {
     throw new Error("Invalid push subscription.");
   }
   if (typeof value.endpoint !== "string" || !isAllowedPushEndpoint(value.endpoint)) {
@@ -179,10 +195,59 @@ export function parsePushSubscription(input: unknown): PushSubscriptionInput {
   }
   validateBase64UrlKey(keys.p256dh, 65, "Push p256dh key", 0x04);
   validateBase64UrlKey(keys.auth, 16, "Push auth key");
+  const preferences =
+    value.preferences === undefined ? undefined : parsePushPreferences(value.preferences);
   return {
     endpoint: value.endpoint,
     expirationTime: value.expirationTime ?? null,
     keys: { p256dh: keys.p256dh, auth: keys.auth },
+    ...(preferences ? { preferences } : {}),
+  };
+}
+
+export function parsePushPreferences(input: unknown): PushPreferences {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error("Invalid push preferences.");
+  }
+  const value = input as Record<string, unknown>;
+  const keys = [
+    "overBudget",
+    "remaining25",
+    "remaining15",
+    "remaining5",
+    "weeklyReset",
+    "unscheduledReset",
+  ];
+  if (!hasExactKeys(value, keys) || keys.some((key) => typeof value[key] !== "boolean")) {
+    throw new Error("Invalid push preferences.");
+  }
+  return {
+    overBudget: value.overBudget as boolean,
+    remaining25: value.remaining25 as boolean,
+    remaining15: value.remaining15 as boolean,
+    remaining5: value.remaining5 as boolean,
+    weeklyReset: value.weeklyReset as boolean,
+    unscheduledReset: value.unscheduledReset as boolean,
+  };
+}
+
+export function parsePushPreferenceUpdate(input: unknown): {
+  endpoint: string;
+  preferences: PushPreferences;
+} {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error("Invalid push preference update.");
+  }
+  const value = input as Record<string, unknown>;
+  if (!hasExactKeys(value, ["endpoint", "preferences"]) || typeof value.endpoint !== "string") {
+    throw new Error("Invalid push preference update.");
+  }
+  if (!isAllowedPushEndpoint(value.endpoint)) {
+    throw new Error("Push endpoint is not an allowed browser service.");
+  }
+  return {
+    endpoint: value.endpoint,
+    preferences: parsePushPreferences(value.preferences),
   };
 }
 
@@ -224,13 +289,26 @@ export class PushNotificationService {
 
   initializeBaseline(): void {
     if (!this.configuration) return;
-    this.baselineCurrentPace();
+    for (const subscription of this.store.getPushSubscriptions()) {
+      if (!this.store.getPushNotificationState(subscription.endpoint)) {
+        this.baselineSubscription(subscription.endpoint);
+      }
+    }
   }
 
-  subscribe(subscription: PushSubscriptionInput): void {
+  subscribe(subscription: PushSubscriptionInput): PushPreferences {
     if (!this.configuration) throw new Error("Push notifications are not configured.");
-    this.baselineCurrentPace();
-    this.store.upsertPushSubscription(subscription, new Date().toISOString());
+    const stored = this.store.upsertPushSubscription(subscription, new Date().toISOString());
+    this.baselineSubscription(stored.endpoint);
+    return stored.preferences;
+  }
+
+  updatePreferences(endpoint: string, preferences: PushPreferences): PushPreferences {
+    if (!this.configuration) throw new Error("Push notifications are not configured.");
+    const stored = this.store.updatePushPreferences(endpoint, preferences, new Date().toISOString());
+    if (!stored) throw new MissingPushSubscriptionError();
+    this.baselineSubscription(endpoint);
+    return stored.preferences;
   }
 
   unsubscribe(endpoint: string): void {
@@ -241,39 +319,177 @@ export class PushNotificationService {
     if (!this.configuration || !result.ok || result.observationId === null) return;
     const cursor = this.store.getLatestObservationCursor();
     if (!cursor || cursor.id !== result.observationId) return;
-    const prior = this.store.getPushTransitionState();
-    if (prior && prior.lastObservationId >= cursor.id) return;
+    const subscriptions = this.store.getPushSubscriptions();
+    if (subscriptions.length === 0) return;
 
     const pace = this.currentPace();
-    const enteredOverBudget =
-      !this.store.observationHasGap(cursor.id) &&
-      prior !== null &&
-      SAFE_PACE_BASELINES[prior.paceStatus] === true &&
-      OVER_BUDGET_PACE_STATUSES[pace.status] === true;
+    const gap = this.store.observationHasGap(cursor.id);
+    const weeklyWindow = this.currentWeeklyWindow(cursor.observedAt);
+    const confirmedReset = weeklyWindow
+      ? confirmedResetEvent(
+          this.store.getObservationEvents(cursor.id, weeklyWindow.key),
+          weeklyWindow,
+        )
+      : null;
+    const resetType =
+      !gap && confirmedReset
+        ? classifyReset(confirmedReset, cursor.observedAt)
+        : null;
+    const deliveries: Array<{
+      subscription: StoredPushSubscription;
+      payload: PushNotificationPayload;
+    }> = [];
+    const updatedAt = new Date().toISOString();
 
-    // The cursor is committed before network I/O so a restart cannot replay a notification.
-    this.store.setPushTransitionState(cursor.id, pace.status, new Date().toISOString());
-    if (!enteredOverBudget) return;
+    for (const subscription of subscriptions) {
+      const prior = this.store.getPushNotificationState(subscription.endpoint);
+      if (!prior) {
+        this.store.setPushNotificationState(
+          this.notificationState(subscription.endpoint, cursor.id, pace, weeklyWindow, updatedAt),
+        );
+        continue;
+      }
+      if (prior.lastObservationId >= cursor.id) continue;
 
-    const payload = JSON.stringify({
-      status: "at_risk",
-      projectedPercent: pace.projectedUsedAtReset,
-    });
-    const subscriptions = this.store.getPushSubscriptions();
-    await Promise.allSettled(subscriptions.map((subscription) => this.sendAtMostTwice(subscription, payload)));
+      const next: PushNotificationState = {
+        ...prior,
+        lastObservationId: cursor.id,
+        paceStatus: pace.status,
+        updatedAt,
+      };
+      const payloads: PushNotificationPayload[] = [];
+      const enteredOverBudget =
+        !gap &&
+        SAFE_PACE_BASELINES[prior.paceStatus] === true &&
+        OVER_BUDGET_PACE_STATUSES[pace.status] === true;
+      if (enteredOverBudget && subscription.preferences.overBudget) {
+        payloads.push({
+          type: "overBudget",
+          projectedPercent: pace.projectedUsedAtReset,
+        });
+      }
+
+      if (confirmedReset && weeklyWindow) {
+        next.remainingPercent = weeklyWindow.remainingPercent;
+        next.resetAt = weeklyWindow.resetsAt;
+        next.remaining25Delivered = weeklyWindow.remainingPercent <= 25;
+        next.remaining15Delivered = weeklyWindow.remainingPercent <= 15;
+        next.remaining5Delivered = weeklyWindow.remainingPercent <= 5;
+        if (resetType === "weeklyReset" && subscription.preferences.weeklyReset) {
+          payloads.push({ type: "weeklyReset" });
+        } else if (resetType === "unscheduledReset" && subscription.preferences.unscheduledReset) {
+          payloads.push({ type: "unscheduledReset" });
+        }
+      } else if (!gap && weeklyWindow) {
+        const crossed: Array<25 | 15 | 5> = [];
+        if (
+          prior.remainingPercent !== null &&
+          prior.remainingPercent > 25 &&
+          weeklyWindow.remainingPercent <= 25 &&
+          !prior.remaining25Delivered
+        ) {
+          next.remaining25Delivered = true;
+          if (subscription.preferences.remaining25) crossed.push(25);
+        }
+        if (
+          prior.remainingPercent !== null &&
+          prior.remainingPercent > 15 &&
+          weeklyWindow.remainingPercent <= 15 &&
+          !prior.remaining15Delivered
+        ) {
+          next.remaining15Delivered = true;
+          if (subscription.preferences.remaining15) crossed.push(15);
+        }
+        if (
+          prior.remainingPercent !== null &&
+          prior.remainingPercent > 5 &&
+          weeklyWindow.remainingPercent <= 5 &&
+          !prior.remaining5Delivered
+        ) {
+          next.remaining5Delivered = true;
+          if (subscription.preferences.remaining5) crossed.push(5);
+        }
+        next.remainingPercent = weeklyWindow.remainingPercent;
+        next.resetAt = weeklyWindow.resetsAt;
+        if (crossed.length > 0) {
+          payloads.push({
+            type: "remaining",
+            thresholds: crossed,
+            remainingPercent: weeklyWindow.remainingPercent,
+          });
+        }
+      } else {
+        next.remainingPercent = null;
+      }
+
+      // Cursor and every crossed-key delivery marker are durable before any network I/O.
+      this.store.setPushNotificationState(next);
+      for (const payload of payloads) deliveries.push({ subscription, payload });
+    }
+
+    await Promise.allSettled(
+      deliveries.map(({ subscription, payload }) =>
+        this.sendAtMostTwice(subscription, payload)),
+    );
   }
 
-  private baselineCurrentPace(): void {
+  private baselineSubscription(endpoint: string): void {
     const cursor = this.store.getLatestObservationCursor();
     if (!cursor) return;
-    const prior = this.store.getPushTransitionState();
-    if (prior && prior.lastObservationId > cursor.id) return;
-    this.store.setPushTransitionState(cursor.id, this.currentPace().status, new Date().toISOString());
+    const pace = this.currentPace();
+    const weeklyWindow = this.currentWeeklyWindow(cursor.observedAt);
+    this.store.setPushNotificationState(
+      this.notificationState(
+        endpoint,
+        cursor.id,
+        pace,
+        weeklyWindow,
+        new Date().toISOString(),
+      ),
+    );
   }
 
-  private async sendAtMostTwice(subscription: StoredPushSubscription, payload: string): Promise<void> {
+  private notificationState(
+    endpoint: string,
+    observationId: number,
+    pace: PaceSummary,
+    weeklyWindow: UsageWindow | null,
+    updatedAt: string,
+  ): PushNotificationState {
+    const remaining = weeklyWindow?.remainingPercent ?? null;
+    return {
+      endpoint,
+      lastObservationId: observationId,
+      paceStatus: pace.status,
+      remainingPercent: remaining,
+      resetAt: weeklyWindow?.resetsAt ?? null,
+      remaining25Delivered: remaining !== null && remaining <= 25,
+      remaining15Delivered: remaining !== null && remaining <= 15,
+      remaining5Delivered: remaining !== null && remaining <= 5,
+      updatedAt,
+    };
+  }
+
+  private currentWeeklyWindow(observedAt: string): UsageWindow | null {
+    const observation = this.store.getLatestObservation();
+    const weeklyWindow = observation?.windows.find(
+      (window) =>
+        isRegularWindowKey(window.key) &&
+        window.windowSeconds === WEEKLY_WINDOW_SECONDS &&
+        window.resetsAt !== null &&
+        window.observedAt === observedAt,
+    );
+    if (!weeklyWindow || this.store.isWindowPending(weeklyWindow.key)) return null;
+    return weeklyWindow;
+  }
+
+  private async sendAtMostTwice(
+    subscription: StoredPushSubscription,
+    payload: PushNotificationPayload,
+  ): Promise<void> {
+    const encoded = JSON.stringify(payload);
     try {
-      await this.sendOnce(subscription, payload);
+      await this.sendOnce(subscription, encoded, payload.type);
       return;
     } catch (error) {
       const statusCode = pushStatusCode(error);
@@ -286,7 +502,7 @@ export class PushNotificationService {
 
     await this.sleep(TRANSIENT_RETRY_DELAY_MILLISECONDS);
     try {
-      await this.sendOnce(subscription, payload);
+      await this.sendOnce(subscription, encoded, payload.type);
     } catch (error) {
       const statusCode = pushStatusCode(error);
       if (statusCode === 404 || statusCode === 410) {
@@ -295,7 +511,11 @@ export class PushNotificationService {
     }
   }
 
-  private sendOnce(subscription: StoredPushSubscription, payload: string): Promise<unknown> {
+  private sendOnce(
+    subscription: StoredPushSubscription,
+    payload: string,
+    type: PushNotificationPayload["type"],
+  ): Promise<unknown> {
     return this.send(
       { endpoint: subscription.endpoint, keys: subscription.keys },
       payload,
@@ -303,11 +523,69 @@ export class PushNotificationService {
         TTL: 300,
         timeout: PUSH_TIMEOUT_MILLISECONDS,
         urgency: "high",
-        topic: "pace-at-risk",
+        topic: notificationTopic(type),
         vapidDetails: this.configuration!,
       },
     );
   }
+}
+
+class MissingPushSubscriptionError extends Error {
+  constructor() {
+    super("Push subscription was not found.");
+  }
+}
+
+function isRegularWindowKey(key: string): boolean {
+  return (
+    key === "primary" ||
+    key === "secondary" ||
+    key === "openai-codex:primary" ||
+    key === "openai-codex:secondary"
+  );
+}
+
+function confirmedResetEvent(
+  events: ObservationEvent[],
+  weeklyWindow: UsageWindow,
+): ObservationEvent | null {
+  return events.find((event) => {
+    if (
+      event.kind !== "reset_timestamp_changed" ||
+      event.uncertainty !== "low" ||
+      event.previousResetAt === null ||
+      event.currentResetAt === null ||
+      event.currentResetAt !== weeklyWindow.resetsAt
+    ) {
+      return false;
+    }
+    const previous = Date.parse(event.previousResetAt);
+    const current = Date.parse(event.currentResetAt);
+    return Number.isFinite(previous) && Number.isFinite(current) && current > previous;
+  }) ?? null;
+}
+
+function classifyReset(
+  event: ObservationEvent,
+  observedAt: string,
+): "weeklyReset" | "unscheduledReset" | null {
+  const observed = Date.parse(observedAt);
+  const scheduled = Date.parse(event.previousResetAt!);
+  if (!Number.isFinite(observed) || !Number.isFinite(scheduled)) return null;
+  const offset = observed - scheduled;
+  if (Math.abs(offset) <= SCHEDULED_RESET_TOLERANCE_MILLISECONDS) {
+    return "weeklyReset";
+  }
+  return offset < -SCHEDULED_RESET_TOLERANCE_MILLISECONDS
+    ? "unscheduledReset"
+    : null;
+}
+
+function notificationTopic(type: PushNotificationPayload["type"]): string {
+  if (type === "overBudget") return "usage-over-budget";
+  if (type === "remaining") return "usage-remaining";
+  if (type === "weeklyReset") return "usage-weekly-reset";
+  return "usage-unscheduled-reset";
 }
 
 export async function handlePushApiRequest(
@@ -324,7 +602,13 @@ export async function handlePushApiRequest(
   }
 
   if (url.pathname !== "/api/push/subscriptions") return null;
-  if (request.method !== "POST" && request.method !== "DELETE") return methodNotAllowed("POST, DELETE");
+  if (
+    request.method !== "POST" &&
+    request.method !== "PATCH" &&
+    request.method !== "DELETE"
+  ) {
+    return methodNotAllowed("POST, PATCH, DELETE");
+  }
   if (!sameOriginMutation(request, url)) {
     return pushJson({ error: "same-origin request required" }, false, 403);
   }
@@ -342,13 +626,23 @@ export async function handlePushApiRequest(
 
   try {
     if (request.method === "POST") {
-      notifications.subscribe(parsePushSubscription(body));
-      return pushJson({ subscribed: true }, false, 201);
+      const preferences = notifications.subscribe(parsePushSubscription(body));
+      return pushJson({ subscribed: true, preferences }, false, 201);
+    }
+    if (request.method === "PATCH") {
+      const update = parsePushPreferenceUpdate(body);
+      const preferences = notifications.updatePreferences(update.endpoint, update.preferences);
+      return pushJson({ subscribed: true, preferences }, false);
     }
     notifications.unsubscribe(parsePushUnsubscribe(body));
     return pushJson({ subscribed: false }, false);
   } catch (error) {
-    return pushJson({ error: error instanceof Error ? error.message : "invalid push request" }, false, 400);
+    const status = error instanceof MissingPushSubscriptionError ? 404 : 400;
+    return pushJson(
+      { error: error instanceof Error ? error.message : "invalid push request" },
+      false,
+      status,
+    );
   }
 }
 
