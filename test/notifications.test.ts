@@ -129,7 +129,7 @@ describe("Web Push transition dispatch", () => {
     notifications.initializeBaseline();
     const first = insert(store, 0);
     await notifications.handleCollection(first);
-    currentPace = pace("at_risk", 118.4);
+    currentPace = pace("exhausted", 100);
     await notifications.handleCollection(insert(store, 1));
     expect(payloads).toEqual([]);
 
@@ -162,7 +162,7 @@ describe("Web Push transition dispatch", () => {
     store.close();
   });
 
-  test("persists the cursor before delivery and suppresses repeats, restart replay, gaps, unknown, and exhausted paths", async () => {
+  test("persists the cursor before delivery and suppresses repeats, restart replay, gaps, and unknown paths", async () => {
     const store = new DatabaseStore(join(scratch(), "usage.sqlite"));
     let currentPace = pace("on_track", 100);
     const deliveredAtCursors: number[] = [];
@@ -197,7 +197,8 @@ describe("Web Push transition dispatch", () => {
     currentPace = pace("on_track", 100);
     await restarted.handleCollection(insert(store, 6));
     currentPace = pace("exhausted", 140);
-    await restarted.handleCollection(insert(store, 7));
+    const exhaustionCrossing = insert(store, 7);
+    await restarted.handleCollection(exhaustionCrossing);
     currentPace = pace("at_risk", 115);
     await restarted.handleCollection(insert(store, 8));
     currentPace = pace("on_track", 100);
@@ -205,7 +206,7 @@ describe("Web Push transition dispatch", () => {
     currentPace = pace("at_risk", 115);
     await restarted.handleCollection(insert(store, 20, 60));
     await restarted.handleCollection(insert(store, 21));
-    expect(deliveredAtCursors).toHaveLength(1);
+    expect(deliveredAtCursors).toEqual([crossing.observationId!, exhaustionCrossing.observationId!]);
     expect(store.getPushTransitionState()?.paceStatus).toBe("at_risk");
     expect(initial.observationId).toBeGreaterThan(0);
     store.close();

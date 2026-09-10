@@ -20,6 +20,10 @@ const SAFE_PACE_BASELINES: Partial<Record<PaceStatus, true>> = {
   room_to_spend: true,
   on_track: true,
 };
+const OVER_BUDGET_PACE_STATUSES: Partial<Record<PaceStatus, true>> = {
+  at_risk: true,
+  exhausted: true,
+};
 const EXACT_PUSH_HOSTS: Record<string, true> = {
   "fcm.googleapis.com": true,
   "push.services.mozilla.com": true,
@@ -241,15 +245,15 @@ export class PushNotificationService {
     if (prior && prior.lastObservationId >= cursor.id) return;
 
     const pace = this.currentPace();
-    const enteredAtRisk =
+    const enteredOverBudget =
       !this.store.observationHasGap(cursor.id) &&
       prior !== null &&
       SAFE_PACE_BASELINES[prior.paceStatus] === true &&
-      pace.status === "at_risk";
+      OVER_BUDGET_PACE_STATUSES[pace.status] === true;
 
     // The cursor is committed before network I/O so a restart cannot replay a notification.
     this.store.setPushTransitionState(cursor.id, pace.status, new Date().toISOString());
-    if (!enteredAtRisk) return;
+    if (!enteredOverBudget) return;
 
     const payload = JSON.stringify({
       status: "at_risk",
