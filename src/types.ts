@@ -11,6 +11,26 @@ export type PaceStatus = "unknown" | "room_to_spend" | "on_track" | "at_risk" | 
 export type EventUncertainty = "low" | "medium" | "high";
 export type RedemptionAuditState = "planned" | "in_flight" | "final" | "ambiguous";
 
+export interface PushSubscriptionInput {
+  endpoint: string;
+  expirationTime: number | null;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+}
+
+export interface StoredPushSubscription extends PushSubscriptionInput {
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PushTransitionState {
+  lastObservationId: number;
+  paceStatus: PaceStatus;
+  updatedAt: string;
+}
+
 export interface AccountSummary {
   planType: string | null;
   subscriptionExpiresAt: string | null;
@@ -164,6 +184,7 @@ export interface CollectionResult {
   ok: boolean;
   state: SourceState;
   observedAt: string | null;
+  observationId: number | null;
   error: string | null;
   nextAttemptAt: string | null;
   redemptionAudit: RedemptionAudit | null;

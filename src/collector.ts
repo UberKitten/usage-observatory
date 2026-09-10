@@ -278,7 +278,7 @@ export class UsageCollector {
         },
       };
 
-      this.store.insertObservation(
+      const observationId = this.store.insertObservation(
         observation,
         this.config.mode,
         Math.max(this.config.staleAfterSeconds * 2, this.config.intervalSeconds * 3),
@@ -290,6 +290,7 @@ export class UsageCollector {
         ok: true,
         state: successState,
         observedAt,
+        observationId,
         error: null,
         nextAttemptAt: this.nextAttemptAt,
         redemptionAudit,
@@ -304,6 +305,7 @@ export class UsageCollector {
         ok: false,
         state: failure.state,
         observedAt: null,
+        observationId: null,
         error: failure.message,
         nextAttemptAt: this.nextAttemptAt,
         redemptionAudit: null,

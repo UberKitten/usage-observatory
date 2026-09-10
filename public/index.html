@@ -7,7 +7,8 @@
     <meta name="theme-color" content="#10071f">
     <meta name="description" content="OpenAI Codex subscription allowance history and weekly trajectory.">
     <title>Codex Usage Observatory</title>
-    <link rel="stylesheet" href="/styles.css?v=20260909-live-warp-4">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="stylesheet" href="/styles.css?v=push-1">
   </head>
   <body data-pace="unknown">
     <a class="skip-link" href="#main-content">Skip to usage</a>
@@ -146,6 +147,14 @@
           <strong id="bank-count"></strong>
           <time id="bank-expiry" hidden></time>
         </article>
+        <article class="compact-card push-card panel" id="push-card" hidden>
+          <div class="push-copy">
+            <span>Browser alerts</span>
+            <strong id="push-status" aria-live="polite">Checking support…</strong>
+            <small id="push-detail">Get an alert only when usage newly crosses over budget.</small>
+          </div>
+          <button class="secondary-button" id="push-toggle" type="button" hidden>Enable alerts</button>
+        </article>
       </section>
 
       <section class="resets-panel panel" id="resets-panel" aria-labelledby="resets-title" hidden>
@@ -155,6 +164,6 @@
 
     </main>
 
-    <script src="/app.js?v=20260909-live-warp-2" defer></script>
+    <script src="/app.js?v=push-1" defer></script>
   </body>
 </html>

@@ -12,15 +12,16 @@ This project does **not** report general ChatGPT message, Voice, image, or tool-
 - Recent local consumption velocity plus a cycle-to-date weekly end-of-window projection with its elapsed-window basis and assumptions
 - Collector freshness, stale/auth-failed/offline states, and the last successful observation
 - Saved Codex rate-limit resets, their expiries, and a durable redemption audit
+- Optional per-browser Web Push alerts for a fresh transition from under/on budget into `at_risk`
 - A responsive, reduced-motion-aware space UI with under-budget warp travel, calibrated on-track drift, slower over-budget motion, and static visible stars for reduced motion
 
 Subscription renewal or cancellation-effective dates are shown only when a source actually provides them. The Codex usage interface currently does not, so the UI omits them rather than confusing them with allowance reset times.
 
 ## Architecture
 
-One Bun application process serves the UI and API, runs the collector, pushes committed collection outcomes to connected browsers over a same-origin WebSocket, and stores normalized allowlisted metadata in one SQLite database. There is no Redis, external database, queue, or analytics service. Collection remains server-scheduled at 300 seconds by default; WebSocket clients trigger no provider request. The browser immediately refetches the dashboard and its currently selected history range after a pushed outcome or reconnect, with a 60-second dashboard refetch retained as a transport-independent fallback.
+One Bun application process serves the UI and API, runs the collector, pushes committed collection outcomes to connected browsers over a same-origin WebSocket, dispatches optional Web Push alerts, and stores normalized observations in one SQLite database. There is no Redis, external database, queue, or analytics service. Collection remains server-scheduled at 300 seconds by default; browser and WebSocket clients trigger no provider request. The browser immediately refetches the dashboard and its currently selected history range after a pushed outcome or reconnect, with a 60-second dashboard refetch retained as a transport-independent fallback.
 
-The database stores timestamps, meter names, percentages, reset times, source state, credit expiry/status, and redemption audit outcomes. It never stores OAuth access/refresh tokens, cookies, raw provider responses, email addresses, or account identifiers.
+The database stores timestamps, meter names, percentages, reset times, source state, credit expiry/status, redemption audit outcomes, opted-in browser subscriptions, and the last processed push-transition cursor. A browser subscription's endpoint and standard `p256dh`/`auth` delivery values are capability secrets: they are never returned by an API or logged. The app never stores notification payload history, OAuth access/refresh tokens, cookies, raw provider responses, email addresses, or account identifiers.
 
 ## Authentication boundary
 
@@ -30,7 +31,7 @@ The credential is read only for upstream requests and is never returned by the A
 
 For local review on a trusted workstation, `USAGE_SOURCE_MODE=command` can consume the sanitized output of `omp usage --json`. This keeps OAuth refresh and storage inside OMP and imports only the `openai-codex` report. Do not expose a command-mode process to a network.
 
-The observatory itself contains private account metadata. Put it behind an authenticated reverse proxy and keep the container listener private. The supplied Compose file binds only to `127.0.0.1`; change that only when a protected ingress network requires it.
+The observatory itself contains private account metadata. Keep the existing Pomerium/authenticated reverse-proxy route authoritative for the UI and every API, including push subscription APIs; do not add a public notification route. Keep the container listener private. The supplied Compose file binds only to `127.0.0.1`; change that only when a protected ingress network requires it. Subscription mutations additionally require an exact same-origin `Origin`, bounded schema-checked JSON, and an HTTPS endpoint from an allowlisted browser push vendor.
 
 ## Run locally
 
@@ -62,10 +63,11 @@ Fixture mode stays visibly labeled and cannot redeem saved resets.
 2. Create the persistent directory and give the container user exclusive access: `mkdir -p data && chmod 0700 data && chown 1000:1000 data`.
 3. Pull the published multi-architecture image: `docker compose pull`.
 4. Create a new app-owned OAuth grant: `docker compose run --rm usage-observatory bun run auth:login -- /data/oauth.json`. Open the printed verification URL, enter its device code, and approve the intended account. The command refuses to replace an existing credential chain.
-5. Keep `AUTO_REDEEM=false` for initial observation, then run `docker compose up -d`.
-6. Verify `http://127.0.0.1:3000/api/health`, then publish only through an authenticated reverse proxy.
+5. Optional: create one owner-only VAPID file with `docker compose run --rm --no-deps usage-observatory bun run push:keygen -- /data/vapid.json mailto:operator@example.com`, then set `VAPID_FILE=/data/vapid.json` in `.env`. The command uses `web-push`, creates the file with mode `0600`, never prints the private key, and refuses to replace any existing path.
+6. Keep `AUTO_REDEEM=false` for initial observation, then run `docker compose up -d`.
+7. Verify `http://127.0.0.1:3000/api/health`, then publish only through the existing authenticated reverse proxy.
 
-The bind-mounted `data` directory contains the indefinite SQLite history and the owner-only rotating OAuth credential. Back up both while preserving mode `0600` for `oauth.json`; use a SQLite-aware snapshot or stop the container while copying. Restoring the directory restores observations, redemption audit, and this application's refresh chain together.
+The bind-mounted `data` directory contains the indefinite SQLite history, the owner-only rotating OAuth credential, and (when enabled) the owner-only VAPID key file. Back it up while preserving mode `0600` for `oauth.json` and `vapid.json`; use a SQLite-aware snapshot or stop the container while copying. Restoring the directory restores observations, redemption audit, push subscriptions and transition cursor, this application's refresh chain, and the stable VAPID identity together.
 
 ## Configuration
 
@@ -84,10 +86,19 @@ The bind-mounted `data` directory contains the indefinite SQLite history and the
 | `USAGE_COMMAND` | `omp usage --json` | Trusted local command used only in `command` mode |
 | `FIXTURE_PATH` | — | Absolute fixture path used only in `fixture` mode |
 | `ADMIN_TOKEN` | unset | Server-only bearer for an explicit collection trigger; unset disables it |
+| `VAPID_FILE` | unset | Optional owner-only (`0600`), service-user-owned JSON VAPID key file; unset disables Web Push |
 | `AUTO_REDEEM` | `false` | Enable expiry-salvage evaluation and consumption |
 | `AUTO_REDEEM_HORIZON_HOURS` | `12` | Credit must expire within this horizon |
 
 Collection failures use bounded exponential backoff and never erase the last good observation. With a dedicated OAuth file, an expiring token is refreshed proactively and a 401/403 receives exactly one refresh-and-retry attempt. Invalid grants or account-context changes become `auth_failed` and require a new dedicated device authorization; transient failures become `error` and eventually `stale` while history remains available.
+
+## Browser alerts
+
+Browser alerts are optional and enabled separately in each browser. The page performs feature detection and registers its service worker, but notification permission is requested only after the user presses **Enable alerts**. Denied permission and unsupported browsers are reported without repeated prompts. On iOS or iPadOS 16.4 and newer, first add the site to the Home Screen and enable alerts from the installed web app.
+
+Subscribing first records the current pace as the durable notification baseline, so newly enabling a browser while already over budget never sends an immediate alert. After each fresh successful collection, the app advances a SQLite cursor before any network send. It dispatches only for an adjacent `room_to_spend`/`on_track` to `at_risk` transition; repeated over-budget samples, process restarts, reconnects, gaps, unknown pace, and exhausted status do not create an alert. A recovered under/on-budget sample arms a later re-crossing. Gone endpoints (`404`/`410`) are pruned, an explicit transient HTTP rejection gets at most one bounded retry, and ambiguous transport errors are not retried.
+
+The payload contains only `at_risk` plus the projected percentage—no account, plan, endpoint, or historical data. The service worker displays it while the page is closed and opens the protected `/` route when clicked. The implementation follows [MDN's Push API guidance](https://developer.mozilla.org/en-US/docs/Web/API/Push_API), [MDN's service-worker notification API](https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorkerRegistration/showNotification), [WebKit's iOS/iPadOS Home Screen requirements](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/), and the vetted [`web-push` library](https://github.com/web-push-libs/web-push).
 
 ## Saved-reset safety
 
@@ -124,8 +135,11 @@ The dedicated login and rotation behavior follows the open-source Codex client's
 - `GET /api/history?range=24h|7d|30d|90d|all` — chart points and reset/gap events
 - `GET /api/live` with a WebSocket upgrade — same-origin committed-collection notifications; clients refetch current allowlisted API views
 - `POST /api/admin/collect` — optional server-token-protected immediate collection
+- `GET /api/push/config` — whether Web Push is configured and, only when enabled, the public VAPID key
+- `POST /api/push/subscriptions` — exact-same-origin opt-in/update with a validated browser subscription
+- `DELETE /api/push/subscriptions` — exact-same-origin opt-out for the calling browser's submitted endpoint
 
-All responses are `Cache-Control: no-store`. Static browser assets contain no account credential or server secret.
+All API responses are `Cache-Control: no-store`. Static browser assets contain no account credential or server secret; HTML and the service worker are served with revalidation.
 
 ## License
 

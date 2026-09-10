@@ -1,16 +1,23 @@
 {
   "name": "usage-observatory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "A private, self-hosted observatory for OpenAI Codex subscription usage.",
   "type": "module",
   "scripts": {
     "start": "bun run src/server.ts",
     "auth:login": "bun run src/auth-cli.ts",
+    "push:keygen": "bun run src/push-keygen.ts",
     "test": "bun test"
   },
   "engines": {
     "bun": ">=1.2.0"
+  },
+  "dependencies": {
+    "web-push": "3.6.7"
+  },
+  "devDependencies": {
+    "@types/web-push": "3.6.4"
   },
   "license": "MIT"
 }

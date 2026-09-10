@@ -27,7 +27,11 @@
     historyLoading: true,
     historyRequest: 0,
     offline: typeof navigator !== "undefined" && navigator.onLine === false,
-    freshnessMode: null
+    freshnessMode: null,
+    pushConfig: null,
+    pushRegistration: null,
+    pushSubscription: null,
+    pushBusy: false
   };
 
   const elements = {};
@@ -42,7 +46,7 @@
     "weekly-loading", "weekly-chart", "weekly-svg-description", "weekly-grid", "weekly-series",
     "weekly-tooltip", "weekly-empty", "freshness-card", "freshness-value",
     "freshness-time", "bank-card", "bank-count", "bank-expiry", "resets-panel",
-    "notable-events"
+    "notable-events", "push-card", "push-status", "push-detail", "push-toggle"
   ];
   let liveSocket = null;
   let liveReconnectTimer = null;
@@ -212,6 +216,183 @@
       throw error;
     } finally {
       window.clearTimeout(timeout);
+    }
+  }
+
+  async function mutatePush(method, body) {
+    const response = await fetch("/api/push/subscriptions", {
+      method,
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  }
+
+  function pushCapability() {
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const standalone = window.matchMedia("(display-mode: standalone)").matches ||
+      window.navigator.standalone === true;
+    if (ios && !standalone) {
+      return {
+        supported: false,
+        status: "Add to Home Screen",
+        detail: "On iPhone or iPad, add this site to the Home Screen, open it there, then enable alerts (iOS/iPadOS 16.4+)."
+      };
+    }
+    if (!window.isSecureContext) {
+      return {
+        supported: false,
+        status: "HTTPS required",
+        detail: "Browser alerts require a secure HTTPS connection."
+      };
+    }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      return {
+        supported: false,
+        status: ios ? "Requires iOS/iPadOS 16.4+" : "Not supported",
+        detail: "This browser does not support standards-based Web Push."
+      };
+    }
+    return { supported: true, status: "", detail: "" };
+  }
+
+  function renderPushControl(status, detail, action = null) {
+    elements["push-card"].hidden = false;
+    elements["push-status"].textContent = status;
+    elements["push-detail"].textContent = detail;
+    const button = elements["push-toggle"];
+    button.hidden = action === null;
+    button.disabled = state.pushBusy;
+    if (action === "enable") button.textContent = "Enable alerts";
+    if (action === "disable") button.textContent = "Disable";
+  }
+
+  function renderCurrentPushControl() {
+    if (Notification.permission === "denied") {
+      renderPushControl(
+        "Blocked in browser settings",
+        "Allow notifications for this site in browser or system settings to enable alerts."
+      );
+      return;
+    }
+    if (state.pushSubscription) {
+      renderPushControl(
+        "Over-budget alerts on",
+        "This browser will be alerted only on a fresh transition from under/on budget to over budget.",
+        "disable"
+      );
+      return;
+    }
+    renderPushControl(
+      "Alerts off",
+      "Enable this browser to get one alert when usage newly crosses over budget.",
+      "enable"
+    );
+  }
+
+  function decodeVapidPublicKey(value) {
+    const padding = "=".repeat((4 - value.length % 4) % 4);
+    const decoded = atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+    return bytes;
+  }
+
+  async function initializePushControls() {
+    renderPushControl("Checking support…", "Browser alerts are optional and never request permission on page load.");
+    let config;
+    try {
+      config = await fetchJSON("/api/push/config");
+    } catch {
+      renderPushControl("Alerts unavailable", "The browser-alert configuration could not be loaded.");
+      return;
+    }
+    if (config.enabled !== true || typeof config.publicKey !== "string") {
+      renderPushControl("Alerts not configured", "The server operator has not enabled browser alerts.");
+      return;
+    }
+    state.pushConfig = config;
+    const capability = pushCapability();
+    if (!capability.supported) {
+      renderPushControl(capability.status, capability.detail);
+      return;
+    }
+
+    try {
+      await navigator.serviceWorker.register("/service-worker.js", {
+        scope: "/",
+        updateViaCache: "none"
+      });
+      state.pushRegistration = await navigator.serviceWorker.ready;
+      state.pushSubscription = await state.pushRegistration.pushManager.getSubscription();
+      if (Notification.permission === "denied") {
+        if (state.pushSubscription) {
+          const subscription = state.pushSubscription;
+          await mutatePush("DELETE", { endpoint: subscription.endpoint });
+          await subscription.unsubscribe();
+          state.pushSubscription = null;
+        }
+        renderCurrentPushControl();
+        return;
+      }
+      if (state.pushSubscription) {
+        await mutatePush("POST", state.pushSubscription.toJSON());
+      }
+      renderCurrentPushControl();
+    } catch {
+      renderPushControl("Alerts unavailable", "This browser could not initialize its push service.");
+    }
+  }
+
+  async function togglePush() {
+    if (state.pushBusy || !state.pushConfig || !state.pushRegistration) return;
+    state.pushBusy = true;
+    elements["push-toggle"].disabled = true;
+    try {
+      if (state.pushSubscription) {
+        const subscription = state.pushSubscription;
+        await mutatePush("DELETE", { endpoint: subscription.endpoint });
+        const unsubscribed = await subscription.unsubscribe();
+        if (!unsubscribed) throw new Error("Browser push subscription remained active.");
+        state.pushSubscription = null;
+        renderCurrentPushControl();
+        return;
+      }
+
+      const permission = Notification.permission === "default"
+        ? await Notification.requestPermission()
+        : Notification.permission;
+      if (permission !== "granted") {
+        renderCurrentPushControl();
+        return;
+      }
+      const subscription = await state.pushRegistration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: decodeVapidPublicKey(state.pushConfig.publicKey)
+      });
+      try {
+        await mutatePush("POST", subscription.toJSON());
+      } catch (error) {
+        await subscription.unsubscribe().catch(() => {});
+        throw error;
+      }
+      state.pushSubscription = subscription;
+      renderCurrentPushControl();
+    } catch {
+      renderPushControl(
+        "Alert change failed",
+        "No alert setting was changed. Check the connection and try again.",
+        state.pushSubscription ? "disable" : "enable"
+      );
+    } finally {
+      state.pushBusy = false;
+      elements["push-toggle"].disabled = false;
     }
   }
 
@@ -1068,6 +1249,7 @@
       if (button) selectRange(button.dataset.range);
     });
     elements["retry-history"].addEventListener("click", loadHistory);
+    elements["push-toggle"].addEventListener("click", togglePush);
     window.addEventListener("offline", () => {
       state.offline = true;
       stopLiveUpdates();
@@ -1101,6 +1283,7 @@
     startClocks();
     requestFullRefresh();
     connectLiveUpdates();
+    void initializePushControls();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initialize, { once: true });

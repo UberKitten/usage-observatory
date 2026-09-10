@@ -3,6 +3,11 @@ import { mkdirSync } from "node:fs";
 import { dirname, extname, resolve, sep } from "node:path";
 import { DatabaseStore } from "./db";
 import { UsageCollector, loadCollectorConfig } from "./collector";
+import {
+  PushNotificationService,
+  handlePushApiRequest,
+  loadVapidConfiguration,
+} from "./notifications";
 import type {
   BankedResetSummary,
   DashboardResponse,
@@ -29,6 +34,7 @@ const CONTENT_TYPES: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
   ".mjs": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -60,9 +66,25 @@ export function startServer(options: ServerOptions = {}): RunningApplication {
   const publicDirectory = resolve(options.publicDirectory ?? resolve(projectRoot, "public"));
   mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
 
+  const vapidConfiguration = loadVapidConfiguration();
   const store = new DatabaseStore(databasePath);
   const collector = new UsageCollector(store, loadCollectorConfig());
-  const handler = createRequestHandler(store, collector, publicDirectory);
+  const notifications = new PushNotificationService(
+    store,
+    vapidConfiguration,
+    () => {
+      const generatedAt = new Date();
+      const observation = store.getLatestObservation();
+      return buildPace(
+        store,
+        observation?.windows ?? [],
+        buildSourceStatus(store, generatedAt).state,
+        generatedAt,
+      );
+    },
+  );
+  notifications.initializeBaseline();
+  const handler = createRequestHandler(store, collector, publicDirectory, notifications);
   const liveClients = new Set<Bun.ServerWebSocket<undefined>>();
   let server: Bun.Server<undefined>;
   try {
@@ -105,6 +127,9 @@ export function startServer(options: ServerOptions = {}): RunningApplication {
       state: result.state,
       observedAt: result.observedAt,
     });
+    void notifications.handleCollection(result).catch(() => {
+      console.error("Web Push transition handling failed.");
+    });
     for (const client of liveClients) {
       if (client.readyState !== 1) continue;
       try {
@@ -134,12 +159,13 @@ export function createRequestHandler(
   store: DatabaseStore,
   collector: UsageCollector,
   publicDirectory: string,
+  notifications: PushNotificationService | null = null,
 ): (request: Request) => Promise<Response> {
   const adminToken = process.env.ADMIN_TOKEN?.trim() || null;
   return async (request: Request) => {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      return handleApiRequest(request, url, store, collector, adminToken);
+      return handleApiRequest(request, url, store, collector, adminToken, notifications);
     }
     return serveStatic(request, url, publicDirectory);
   };
@@ -151,7 +177,10 @@ async function handleApiRequest(
   store: DatabaseStore,
   collector: UsageCollector,
   adminToken: string | null,
+  notifications: PushNotificationService | null,
 ): Promise<Response> {
+  const pushResponse = await handlePushApiRequest(request, url, notifications);
+  if (pushResponse) return pushResponse;
   if (url.pathname === "/api/dashboard") {
     if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
     return jsonResponse(buildDashboard(store, collector), request.method === "HEAD");
@@ -265,7 +294,7 @@ function sourceDisplayName(mode: SourceMode): string {
   }
 }
 
-function buildPace(
+export function buildPace(
   store: DatabaseStore,
   windows: UsageWindow[],
   sourceState: SourceState,
@@ -481,7 +510,10 @@ async function serveStatic(request: Request, url: URL, publicDirectory: string):
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy":
       "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-    "Cache-Control": extension === ".html" ? "no-cache" : "public, max-age=3600",
+    "Cache-Control":
+      extension === ".html" || requested === "service-worker.js"
+        ? "no-cache"
+        : "public, max-age=3600",
   });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers });
   return new Response(file, { status: 200, headers });

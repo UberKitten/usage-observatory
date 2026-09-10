@@ -4,11 +4,15 @@ import type {
   HistoryRange,
   NormalizedObservation,
   ObservationEvent,
+  PaceStatus,
+  PushSubscriptionInput,
+  PushTransitionState,
   RedemptionAudit,
   RedemptionAuditState,
   ResetCredit,
   SourceMode,
   SourceState,
+  StoredPushSubscription,
 } from "./types";
 
 const MIGRATIONS = [
@@ -92,6 +96,30 @@ const MIGRATIONS = [
     CREATE INDEX redemption_audit_state_idx
       ON redemption_audit(state, id);
   `,
+  `
+    ALTER TABLE observation_events
+      ADD COLUMN observation_id INTEGER REFERENCES observations(id);
+    CREATE INDEX observation_events_observation_idx
+      ON observation_events(observation_id, kind);
+
+    CREATE TABLE web_push_subscriptions (
+      endpoint TEXT PRIMARY KEY,
+      expiration_time INTEGER,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE web_push_transition_state (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      last_observation_id INTEGER NOT NULL REFERENCES observations(id),
+      pace_status TEXT NOT NULL CHECK (
+        pace_status IN ('unknown', 'room_to_spend', 'on_track', 'at_risk', 'exhausted')
+      ),
+      updated_at TEXT NOT NULL
+    );
+  `,
 ] as const;
 
 interface SourceStatusRow {
@@ -173,6 +201,21 @@ interface AuditRow {
   finalized_at: string | null;
   outcome: string | null;
   reason: string | null;
+}
+
+interface PushSubscriptionRow {
+  endpoint: string;
+  expiration_time: number | null;
+  p256dh: string;
+  auth: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PushTransitionStateRow {
+  last_observation_id: number;
+  pace_status: PaceStatus;
+  updated_at: string;
 }
 
 const RANGE_MILLISECONDS: Record<Exclude<HistoryRange, "all">, number> = {
@@ -534,7 +577,9 @@ export class DatabaseStore {
             deltaUsedPercent: null,
             uncertainty: "high",
             detail: `No observations were recorded for ${Math.round(gapSeconds)} seconds; activity during the gap is unknown.`,
-          });
+          },
+          observationId,
+          );
         }
       }
 
@@ -608,7 +653,9 @@ export class DatabaseStore {
             uncertainty: "low",
             detail:
               "The prior scheduled boundary was crossed or zero usage was observed, and the next reset advanced.",
-          });
+          },
+          observationId,
+          );
           continue;
         }
 
@@ -623,7 +670,9 @@ export class DatabaseStore {
             uncertainty: "high",
             detail:
               "Used percentage decreased without confirmed reset evidence; the derived view will keep it pending until later observations resolve it.",
-          });
+          },
+          observationId,
+          );
           continue;
         }
 
@@ -649,7 +698,9 @@ export class DatabaseStore {
             : delta !== 0
               ? "The reported reset timestamp changed alongside nonzero usage movement; the provider did not state why."
               : "The reported reset schedule shifted materially; the provider did not state why.",
-        });
+        },
+        observationId,
+      );
       }
 
       this.database.exec("COMMIT");
@@ -661,13 +712,13 @@ export class DatabaseStore {
     }
   }
 
-  private insertEvent(event: Omit<ObservationEvent, "id">): void {
+  private insertEvent(event: Omit<ObservationEvent, "id">, observationId: number): void {
     this.database
       .query(
         `INSERT INTO observation_events (
            kind, window_key, observed_at, previous_reset_at, current_reset_at,
-           delta_used_percent, uncertainty, detail
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           delta_used_percent, uncertainty, detail, observation_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         event.kind,
@@ -678,6 +729,7 @@ export class DatabaseStore {
         event.deltaUsedPercent,
         event.uncertainty,
         event.detail,
+        observationId,
       );
   }
 
@@ -859,6 +911,123 @@ export class DatabaseStore {
       .query<{ count: number }, []>("SELECT count(*) AS count FROM observation_events")
       .get()?.count ?? 0;
     return { observationCount: observations, eventCount: events };
+  }
+
+  getLatestObservationCursor(): { id: number; observedAt: string } | null {
+    const row = this.database
+      .query<{ id: number; observed_at: string }, []>(
+        "SELECT id, observed_at FROM observations ORDER BY observed_at DESC, id DESC LIMIT 1",
+      )
+      .get();
+    return row ? { id: row.id, observedAt: row.observed_at } : null;
+  }
+
+  observationHasGap(observationId: number): boolean {
+    return this.database
+      .query<{ present: number }, [number]>(
+        `SELECT 1 AS present
+           FROM observation_events
+          WHERE observation_id = ? AND kind = 'observation_gap'
+          LIMIT 1`,
+      )
+      .get(observationId)?.present === 1;
+  }
+
+  upsertPushSubscription(subscription: PushSubscriptionInput, at: string): void {
+    this.database
+      .query(
+        `INSERT INTO web_push_subscriptions(
+           endpoint, expiration_time, p256dh, auth, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET
+           expiration_time = excluded.expiration_time,
+           p256dh = excluded.p256dh,
+           auth = excluded.auth,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        subscription.endpoint,
+        subscription.expirationTime,
+        subscription.keys.p256dh,
+        subscription.keys.auth,
+        at,
+        at,
+      );
+  }
+
+  deletePushSubscription(endpoint: string): boolean {
+    return this.database
+      .query("DELETE FROM web_push_subscriptions WHERE endpoint = ?")
+      .run(endpoint).changes > 0;
+  }
+
+  deletePushSubscriptionIfUnchanged(subscription: PushSubscriptionInput): boolean {
+    return this.database
+      .query(
+        `DELETE FROM web_push_subscriptions
+          WHERE endpoint = ? AND p256dh = ? AND auth = ?`,
+      )
+      .run(subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth).changes > 0;
+  }
+
+  getPushSubscriptions(nowMilliseconds = Date.now()): StoredPushSubscription[] {
+    this.database
+      .query(
+        `DELETE FROM web_push_subscriptions
+          WHERE expiration_time IS NOT NULL AND expiration_time <= ?`,
+      )
+      .run(nowMilliseconds);
+    return this.database
+      .query<PushSubscriptionRow, []>(
+        `SELECT endpoint, expiration_time, p256dh, auth, created_at, updated_at
+           FROM web_push_subscriptions
+          ORDER BY created_at, endpoint`,
+      )
+      .all()
+      .map((row) => ({
+        endpoint: row.endpoint,
+        expirationTime: row.expiration_time,
+        keys: { p256dh: row.p256dh, auth: row.auth },
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+  }
+
+  getPushSubscriptionCount(): number {
+    return this.database
+      .query<{ count: number }, []>("SELECT count(*) AS count FROM web_push_subscriptions")
+      .get()?.count ?? 0;
+  }
+
+  getPushTransitionState(): PushTransitionState | null {
+    const row = this.database
+      .query<PushTransitionStateRow, []>(
+        `SELECT last_observation_id, pace_status, updated_at
+           FROM web_push_transition_state
+          WHERE singleton = 1`,
+      )
+      .get();
+    return row
+      ? {
+          lastObservationId: row.last_observation_id,
+          paceStatus: row.pace_status,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  setPushTransitionState(observationId: number, paceStatus: PaceStatus, at: string): void {
+    this.database
+      .query(
+        `INSERT INTO web_push_transition_state(
+           singleton, last_observation_id, pace_status, updated_at
+         ) VALUES (1, ?, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+           last_observation_id = excluded.last_observation_id,
+           pace_status = excluded.pace_status,
+           updated_at = excluded.updated_at`,
+      )
+      .run(observationId, paceStatus, at);
   }
 
   planRedemption(creditId: string, redeemRequestId: string, plannedAt: string): RedemptionAudit {

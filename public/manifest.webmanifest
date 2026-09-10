@@ -1,0 +1,11 @@
+{
+  "id": "/",
+  "name": "Usage Observatory",
+  "short_name": "Observatory",
+  "description": "Private OpenAI Codex subscription usage observatory.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#08040f",
+  "theme_color": "#10071f"
+}
