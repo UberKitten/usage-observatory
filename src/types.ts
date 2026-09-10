@@ -83,9 +83,7 @@ export interface BankedResetSummary {
   supported: boolean;
   thresholds: {
     expiryHorizonHours: number;
-    minimumUsedPercent: number;
     maximumReportAgeSeconds: number;
-    eligibleWindows: string[];
   };
   status: "unavailable" | "none" | "available" | RedemptionAuditState;
   expiresAt: string | null;

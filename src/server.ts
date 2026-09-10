@@ -378,9 +378,7 @@ function buildBankedReset(
   const audit = store.getLatestAudit();
   const thresholds = {
     expiryHorizonHours: policy.expiryHorizonHours,
-    minimumUsedPercent: policy.minimumUsedPercent,
     maximumReportAgeSeconds: policy.maximumReportAgeSeconds,
-    eligibleWindows: policy.eligibleWindows,
   };
   const lastActionAt = audit?.finalizedAt ?? audit?.attemptedAt ?? audit?.plannedAt ?? null;
 
@@ -445,7 +443,7 @@ function buildBankedReset(
     expiresAt: observation.resetCredits.earliestExpiresAt,
     lastActionAt: null,
     reason: policy.enabled
-      ? `Automatic salvage requires a live-listed, dated, unexpired credit within ${policy.expiryHorizonHours} hours, a report no older than ${policy.maximumReportAgeSeconds} seconds, and at least ${policy.minimumUsedPercent}% use in a regular Codex 5-hour or weekly window. Spark usage is excluded.`
+      ? `Automatic salvage attempts every live-listed, dated, unexpired credit within ${policy.expiryHorizonHours} hours when the usage report is no older than ${policy.maximumReportAgeSeconds} seconds. Allowance consumption does not suppress an expiring-credit attempt.`
       : "Automatic redemption is disabled by default. Reset credits are observable, but no public redemption endpoint is exposed.",
     availableCount: observation.resetCredits.availableCount,
     autoRedeemEnabled: policy.enabled,

@@ -86,7 +86,6 @@ The bind-mounted `data` directory contains the indefinite SQLite history and the
 | `ADMIN_TOKEN` | unset | Server-only bearer for an explicit collection trigger; unset disables it |
 | `AUTO_REDEEM` | `false` | Enable expiry-salvage evaluation and consumption |
 | `AUTO_REDEEM_HORIZON_HOURS` | `12` | Credit must expire within this horizon |
-| `AUTO_REDEEM_MIN_USED_PERCENT` | `25` | A regular Codex chat window must have at least this much real usage to restore |
 
 Collection failures use bounded exponential backoff and never erase the last good observation. With a dedicated OAuth file, an expiring token is refreshed proactively and a 401/403 receives exactly one refresh-and-retry attempt. Invalid grants or account-context changes become `auth_failed` and require a new dedicated device authorization; transient failures become `error` and eventually `stale` while history remains available.
 
@@ -94,12 +93,13 @@ Collection failures use bounded exponential backoff and never erase the last goo
 
 Automatic redemption is off by default. When enabled, the collector:
 
-1. requires a fresh regular Codex chat allowance observation (never a Spark-only meter);
+1. requires a fresh live usage report no more than ten minutes old;
 2. live-lists credits and selects the available one with the earliest parseable expiry;
-3. requires the credit to expire within the configured horizon and at least one regular chat window to be meaningfully consumed;
-4. commits a durable credit-specific idempotency key before sending exactly one consume request;
-5. records `reset`, provider no-op, failure, or ambiguous transport state; and
-6. never automatically retries an ambiguous consume.
+3. requires the credit to expire within the configured horizon, regardless of whether any regular or Spark allowance has been consumed;
+4. re-fetches both the credit listing and usage report immediately before the attempt;
+5. commits a durable credit-specific idempotency key before sending exactly one consume request;
+6. records `reset`, provider no-op such as `nothing_to_reset`, failure, or ambiguous transport state; and
+7. never automatically retries an ambiguous consume.
 
 This follows the provider's `redeem_request_id` idempotency contract while preferring duplicate safety. It never buys credits, enables auto-reload, changes a plan, or spends a reset merely for testing. The browser has no unauthenticated redemption endpoint and receives no operator token.
 

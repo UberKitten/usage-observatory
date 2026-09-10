@@ -58,7 +58,6 @@ export interface CollectorConfig {
   backoffMaximumSeconds: number;
   autoRedeem: boolean;
   autoRedeemHorizonHours: number;
-  autoRedeemMinimumUsedPercent: number;
   maximumReportAgeSeconds: number;
 }
 
@@ -115,12 +114,6 @@ export function loadCollectorConfig(env: NodeJS.ProcessEnv = process.env): Colle
     backoffMaximumSeconds: boundedNumber(env.COLLECT_BACKOFF_MAX_SECONDS, 900, 1, 86_400),
     autoRedeem: parseBoolean(env.AUTO_REDEEM, false),
     autoRedeemHorizonHours: boundedNumber(env.AUTO_REDEEM_HORIZON_HOURS, 12, 1, 168),
-    autoRedeemMinimumUsedPercent: boundedNumber(
-      env.AUTO_REDEEM_MIN_USED_PERCENT,
-      25,
-      0,
-      100,
-    ),
     maximumReportAgeSeconds: 600,
   };
 }
@@ -166,16 +159,12 @@ export class UsageCollector {
   getRedemptionPolicy(): {
     enabled: boolean;
     expiryHorizonHours: number;
-    minimumUsedPercent: number;
     maximumReportAgeSeconds: number;
-    eligibleWindows: string[];
   } {
     return {
       enabled: this.config.autoRedeem,
       expiryHorizonHours: this.config.autoRedeemHorizonHours,
-      minimumUsedPercent: this.config.autoRedeemMinimumUsedPercent,
       maximumReportAgeSeconds: this.config.maximumReportAgeSeconds,
-      eligibleWindows: ["regular Codex 5-hour window", "regular Codex weekly window"],
     };
   }
 
@@ -440,20 +429,9 @@ export class UsageCollector {
       };
     }
 
-    const usefulRegularWindow = payload.windows.some(
-      (window) =>
-        REGULAR_CODEX_WINDOW_KEYS[window.key] === true &&
-        window.usedPercent >= this.config.autoRedeemMinimumUsedPercent,
-    );
-    if (!usefulRegularWindow) {
-      return {
-        eligible: false,
-        reason: `No regular Codex 5-hour or weekly window is at least ${this.config.autoRedeemMinimumUsedPercent}% used; Spark windows are never eligible.`,
-      };
-    }
     return {
       eligible: true,
-      reason: "A live-listed, unexpired credit and a fresh, sufficiently used regular Codex window are eligible.",
+      reason: "A live-listed, unexpired credit and a fresh usage report are eligible regardless of allowance consumption.",
     };
   }
 

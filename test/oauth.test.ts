@@ -47,7 +47,6 @@ function liveConfig(oauthFile: string, issuer: string): CollectorConfig {
     backoffMaximumSeconds: 900,
     autoRedeem: false,
     autoRedeemHorizonHours: 12,
-    autoRedeemMinimumUsedPercent: 25,
     maximumReportAgeSeconds: 600,
   };
 }

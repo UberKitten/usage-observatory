@@ -39,7 +39,6 @@ function collectorConfig(overrides: Partial<CollectorConfig> = {}): CollectorCon
     backoffMaximumSeconds: 900,
     autoRedeem: false,
     autoRedeemHorizonHours: 12,
-    autoRedeemMinimumUsedPercent: 25,
     maximumReportAgeSeconds: 600,
     ...overrides,
   };
@@ -350,7 +349,7 @@ describe("history and pace", () => {
   });
 });
 
-describe("saved-reset ambiguity", () => {
+describe("saved-reset safety", () => {
   test("persists one idempotency key and never automatically retries an ambiguous consume", async () => {
     const root = scratch();
     const tokenPath = join(root, "token");
@@ -398,6 +397,101 @@ describe("saved-reset ambiguity", () => {
     expect(second.redemptionAudit?.redeemRequestId).toBe(requestId);
     expect(consumeCalls).toBe(1);
     expect(store.getLatestAudit()?.state).toBe("ambiguous");
+    store.close();
+  });
+  test("attempts an in-horizon available credit even when regular usage is zero", async () => {
+    const root = scratch();
+    const tokenPath = join(root, "token");
+    writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
+    chmodSync(tokenPath, 0o600);
+    const store = new DatabaseStore(join(root, "usage.sqlite"));
+    const now = Date.now();
+    const credit = {
+      id: "RateLimitResetCredit_zero_usage",
+      status: "available",
+      expires_at: new Date(now + 2 * 3_600_000).toISOString(),
+    };
+    const usage = {
+      plan_type: "pro",
+      rate_limit: {
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 18_000,
+          reset_at: Math.floor((now + 3_600_000) / 1_000),
+        },
+      },
+      rate_limit_reset_credits: { available_count: 1 },
+    };
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        return Response.json({ status: "nothing_to_reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [credit] });
+      }
+      return Response.json(usage);
+    }) as typeof fetch;
+
+    const collector = new UsageCollector(store, collectorConfig({
+      mode: "live",
+      tokenFile: tokenPath,
+      autoRedeem: true,
+    }));
+    const result = await collector.collect();
+    expect(result.redemptionAudit?.state).toBe("final");
+    expect(result.redemptionAudit?.outcome).toBe("nothing_to_reset");
+    expect(consumeCalls).toBe(1);
+    store.close();
+  });
+
+  test("does not attempt an available credit outside the expiry horizon", async () => {
+    const root = scratch();
+    const tokenPath = join(root, "token");
+    writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
+    chmodSync(tokenPath, 0o600);
+    const store = new DatabaseStore(join(root, "usage.sqlite"));
+    const now = Date.now();
+    const credit = {
+      id: "RateLimitResetCredit_not_expiring",
+      status: "available",
+      expires_at: new Date(now + 13 * 3_600_000).toISOString(),
+    };
+    const usage = {
+      plan_type: "pro",
+      rate_limit: {
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 18_000,
+          reset_at: Math.floor((now + 3_600_000) / 1_000),
+        },
+      },
+      rate_limit_reset_credits: { available_count: 1 },
+    };
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [credit] });
+      }
+      return Response.json(usage);
+    }) as typeof fetch;
+
+    const collector = new UsageCollector(store, collectorConfig({
+      mode: "live",
+      tokenFile: tokenPath,
+      autoRedeem: true,
+    }));
+    const result = await collector.collect();
+    expect(result.redemptionAudit).toBeNull();
+    expect(store.getLatestAudit()).toBeNull();
+    expect(consumeCalls).toBe(0);
     store.close();
   });
 });
