@@ -408,7 +408,19 @@ function deriveWindowSeries(rows: DerivedWindowRow[]): {
   let index = 1;
   while (index < deduplicated.length) {
     const previous = accepted.at(-1)!;
-    const current = deduplicated[index];
+    const reported = deduplicated[index];
+    const reportedReset = analyzeResetTransition(
+      previous.observed_at,
+      reported.observed_at,
+      previous.resets_at,
+      reported.resets_at,
+    );
+    const current =
+      reportedReset.changed &&
+      !reportedReset.rollsWithObservation &&
+      !reportedReset.materiallyShifted
+        ? { ...reported, resets_at: previous.resets_at }
+        : reported;
     const delta = current.used_percent - previous.used_percent;
     const reset = analyzeResetTransition(
       previous.observed_at,
