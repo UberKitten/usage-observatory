@@ -338,6 +338,18 @@ function resetAdvanced(previousResetAt: string | null, currentResetAt: string | 
   return Number.isFinite(previous) && Number.isFinite(current) && current > previous;
 }
 
+function resetTimestampsEquivalent(left: string | null, right: string | null): boolean {
+  if (left === right) return true;
+  if (left === null || right === null) return false;
+  const leftMilliseconds = Date.parse(left);
+  const rightMilliseconds = Date.parse(right);
+  return (
+    Number.isFinite(leftMilliseconds) &&
+    Number.isFinite(rightMilliseconds) &&
+    Math.abs(leftMilliseconds - rightMilliseconds) < MATERIAL_RESET_SHIFT_MILLISECONDS
+  );
+}
+
 function isConfirmedReset(previous: DerivedWindowRow, current: DerivedWindowRow): boolean {
   if (!resetAdvanced(previous.resets_at, current.resets_at)) return false;
   const reset = analyzeResetTransition(
@@ -408,19 +420,7 @@ function deriveWindowSeries(rows: DerivedWindowRow[]): {
   let index = 1;
   while (index < deduplicated.length) {
     const previous = accepted.at(-1)!;
-    const reported = deduplicated[index];
-    const reportedReset = analyzeResetTransition(
-      previous.observed_at,
-      reported.observed_at,
-      previous.resets_at,
-      reported.resets_at,
-    );
-    const current =
-      reportedReset.changed &&
-      !reportedReset.rollsWithObservation &&
-      !reportedReset.materiallyShifted
-        ? { ...reported, resets_at: previous.resets_at }
-        : reported;
+    const current = deduplicated[index];
     const delta = current.used_percent - previous.used_percent;
     const reset = analyzeResetTransition(
       previous.observed_at,
@@ -437,7 +437,7 @@ function deriveWindowSeries(rows: DerivedWindowRow[]): {
 
     const suspicious =
       delta < -USAGE_DECREASE_EPSILON ||
-      (reset.changed && !reset.rollsWithObservation);
+      reset.materiallyShifted;
     if (!suspicious) {
       accept(current);
       index += 1;
@@ -945,7 +945,7 @@ export class DatabaseStore {
       .filter(
         (row) =>
           row.window_key === windowKey &&
-          row.resets_at === resetAt &&
+          resetTimestampsEquivalent(row.resets_at, resetAt) &&
           row.observed_at >= since,
       )
       .map((row) => ({

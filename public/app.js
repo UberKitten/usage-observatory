@@ -14,6 +14,7 @@
     "30d": 30 * 24 * 60 * 60 * 1000,
     "90d": 90 * 24 * 60 * 60 * 1000
   };
+  const RESET_JITTER_MILLISECONDS = 60 * 1000;
   const PUSH_PREFERENCE_KEYS = [
     "overBudget",
     "remaining25",
@@ -1050,7 +1051,7 @@
         && point.windowKey === windowData.key
         && observed >= start
         && observed <= reset
-        && (pointReset === null || pointReset === resetKey);
+        && (pointReset === null || Math.abs(pointReset - resetKey) < RESET_JITTER_MILLISECONDS);
     });
     matching.push({
       observedAt: windowData.observedAt,

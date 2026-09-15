@@ -436,15 +436,16 @@ describe("history and pace", () => {
   test("keeps sub-minute reset jitter in the current trusted trajectory", async () => {
     const root = scratch();
     const store = new DatabaseStore(join(root, "usage.sqlite"));
-    const resetAt = "2026-09-19T11:30:07.000Z";
-    const jitteredResetAt = "2026-09-19T11:30:06.000Z";
+    const now = Date.now();
+    const resetAt = new Date(now + 4 * 86_400_000).toISOString();
+    const jitteredResetAt = new Date(Date.parse(resetAt) - 1_000).toISOString();
     const samples: Array<[string, number, string]> = [
-      ["2026-09-15T07:00:00.000Z", 15, resetAt],
-      ["2026-09-15T07:05:00.000Z", 16, resetAt],
-      ["2026-09-15T07:10:00.000Z", 17, resetAt],
-      ["2026-09-15T07:15:00.000Z", 18, jitteredResetAt],
-      ["2026-09-15T07:20:00.000Z", 18, jitteredResetAt],
-      ["2026-09-15T07:25:00.000Z", 19, jitteredResetAt],
+      [new Date(now - 25 * 60_000).toISOString(), 15, resetAt],
+      [new Date(now - 20 * 60_000).toISOString(), 16, resetAt],
+      [new Date(now - 15 * 60_000).toISOString(), 17, resetAt],
+      [new Date(now - 10 * 60_000).toISOString(), 18, jitteredResetAt],
+      [new Date(now - 5 * 60_000).toISOString(), 18, jitteredResetAt],
+      [new Date(now).toISOString(), 19, jitteredResetAt],
     ];
     for (const [observedAt, usedPercent, reportedResetAt] of samples) {
       store.insertObservation(
@@ -453,7 +454,7 @@ describe("history and pace", () => {
         10_000,
       );
     }
-    store.recordAttempt("2026-09-15T07:25:00.000Z", "healthy", null, true);
+    store.recordAttempt(samples.at(-1)![0], "healthy", null, true);
     const collector = new UsageCollector(store, collectorConfig({ mode: "command" }));
     const handler = createRequestHandler(store, collector, join(root, "public"));
 
@@ -462,12 +463,14 @@ describe("history and pace", () => {
       (point) => point.windowKey === "openai-codex:primary",
     );
     expect(store.isWindowPending("openai-codex:primary")).toBe(false);
-    expect(dashboard.windows[0]?.observedAt).toBe("2026-09-15T07:25:00.000Z");
-    expect(dashboard.windows[0]?.resetsAt).toBe(resetAt);
+    expect(dashboard.windows[0]?.observedAt).toBe(samples.at(-1)![0]);
+    expect(dashboard.windows[0]?.resetsAt).toBe(jitteredResetAt);
     expect(dashboard.pace.status).toBe("room_to_spend");
     expect(dashboard.pace.recentRatePercentPerHour).not.toBeNull();
     expect(primaryPoints).toHaveLength(samples.length);
-    expect(primaryPoints.every((point) => point.resetsAt === resetAt)).toBe(true);
+    expect(new Set(primaryPoints.map((point) => point.resetsAt))).toEqual(
+      new Set([resetAt, jitteredResetAt]),
+    );
     store.close();
   });
 });
