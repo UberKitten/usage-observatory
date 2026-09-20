@@ -121,6 +121,9 @@ export interface RedemptionAudit {
   finalizedAt: string | null;
   outcome: string | null;
   reason: string | null;
+  expiresAt: string | null;
+  attemptCount: number;
+  nextRetryAt: string | null;
 }
 
 export interface BankedResetSummary {
@@ -128,6 +131,8 @@ export interface BankedResetSummary {
   thresholds: {
     expiryHorizonHours: number;
     maximumReportAgeSeconds: number;
+    retryIntervalSeconds: number;
+    maximumAttempts: number;
   };
   status: "unavailable" | "none" | "available" | RedemptionAuditState;
   expiresAt: string | null;

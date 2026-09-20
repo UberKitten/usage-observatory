@@ -39,8 +39,9 @@ const FINAL_REDEMPTION_OUTCOMES: Record<string, true> = {
   reset: true,
   already_redeemed: true,
   no_credit: true,
-  nothing_to_reset: true,
 };
+const MAX_AUTOMATIC_REDEMPTION_ATTEMPTS = 12;
+const MIN_REDEMPTION_RETRY_SECONDS = 60;
 
 export interface CollectorConfig {
   mode: SourceMode;
@@ -113,7 +114,7 @@ export function loadCollectorConfig(env: NodeJS.ProcessEnv = process.env): Colle
     backoffBaseSeconds: boundedNumber(env.COLLECT_BACKOFF_BASE_SECONDS, 30, 1, 3_600),
     backoffMaximumSeconds: boundedNumber(env.COLLECT_BACKOFF_MAX_SECONDS, 900, 1, 86_400),
     autoRedeem: parseBoolean(env.AUTO_REDEEM, false),
-    autoRedeemHorizonHours: boundedNumber(env.AUTO_REDEEM_HORIZON_HOURS, 12, 1, 168),
+    autoRedeemHorizonHours: boundedNumber(env.AUTO_REDEEM_HORIZON_HOURS, 1, 1, 168),
     maximumReportAgeSeconds: 600,
   };
 }
@@ -160,11 +161,15 @@ export class UsageCollector {
     enabled: boolean;
     expiryHorizonHours: number;
     maximumReportAgeSeconds: number;
+    retryIntervalSeconds: number;
+    maximumAttempts: number;
   } {
     return {
       enabled: this.config.autoRedeem,
       expiryHorizonHours: this.config.autoRedeemHorizonHours,
       maximumReportAgeSeconds: this.config.maximumReportAgeSeconds,
+      retryIntervalSeconds: Math.max(MIN_REDEMPTION_RETRY_SECONDS, this.config.intervalSeconds),
+      maximumAttempts: MAX_AUTOMATIC_REDEMPTION_ATTEMPTS,
     };
   }
 
@@ -345,7 +350,7 @@ export class UsageCollector {
     if (!eligibility.eligible) {
       throw new Error(`Explicit retry refused: ${eligibility.reason}`);
     }
-    return this.consumeCredit(audit, auth);
+    return this.consumeCredit(audit, auth, credit);
   }
 
   private async tryAutomaticRedemption(
@@ -353,46 +358,125 @@ export class UsageCollector {
     credits: ResetCredit[],
     auth: LiveAuth,
   ): Promise<{ parsed: ParsedPayload; listing: CreditListing; audit: RedemptionAudit | null }> {
-    const candidate = selectEarliestAvailableCredit(credits, new Date());
+    const now = new Date();
+    const reconciledAudit = this.reconcileOpenRedemptions(credits, now);
+    const candidate = selectEarliestAvailableCredit(
+      credits,
+      now,
+      (credit) => {
+        const audit = this.store.getAuditByCreditId(credit.id);
+        if (!audit || audit.state === "planned" || audit.state === "ambiguous") return true;
+        return false;
+      },
+    );
     if (!candidate) {
-      return { parsed, listing: { supported: true, known: true, credits }, audit: null };
-    }
-    const initialEligibility = this.checkRedemptionEligibility(parsed.payload, candidate, new Date());
-    if (!initialEligibility.eligible) {
-      return { parsed, listing: { supported: true, known: true, credits }, audit: null };
+      return {
+        parsed,
+        listing: { supported: true, known: true, credits },
+        audit: reconciledAudit ?? this.store.getLatestAudit(),
+      };
     }
 
-    const priorAudit = this.store.getAuditByCreditId(candidate.id);
-    if (priorAudit && priorAudit.state !== "planned") {
-      return { parsed, listing: { supported: true, known: true, credits }, audit: priorAudit };
+    const initialEligibility = this.checkRedemptionEligibility(parsed.payload, candidate, now);
+    if (!initialEligibility.eligible) {
+      return {
+        parsed,
+        listing: { supported: true, known: true, credits },
+        audit: reconciledAudit ?? this.store.getAuditByCreditId(candidate.id),
+      };
+    }
+
+    let priorAudit = this.store.getAuditByCreditId(candidate.id);
+    if (priorAudit) {
+      if (priorAudit.attemptCount >= MAX_AUTOMATIC_REDEMPTION_ATTEMPTS) {
+        priorAudit = this.store.finishRedemption(
+          priorAudit.id,
+          "final",
+          now.toISOString(),
+          "retry_limit_reached",
+          `Automatic retry stopped after ${MAX_AUTOMATIC_REDEMPTION_ATTEMPTS} attempts without a provider-confirmed redemption.`,
+        );
+        return { parsed, listing: { supported: true, known: true, credits }, audit: priorAudit };
+      }
+      const nextRetryAt = priorAudit.nextRetryAt ? Date.parse(priorAudit.nextRetryAt) : Number.NaN;
+      if (Number.isFinite(nextRetryAt) && nextRetryAt > now.getTime()) {
+        return { parsed, listing: { supported: true, known: true, credits }, audit: priorAudit };
+      }
     }
 
     const freshListing = await this.fetchResetCreditListing(auth);
     if (!freshListing.supported || !freshListing.known) {
-      return { parsed, listing: freshListing, audit: priorAudit };
+      return { parsed, listing: freshListing, audit: priorAudit ?? reconciledAudit };
     }
+    const freshReconciliation = this.reconcileOpenRedemptions(freshListing.credits, new Date());
+    priorAudit = this.store.getAuditByCreditId(candidate.id);
     const freshlyListedCredit = freshListing.credits.find(
       (credit) => credit.id === candidate.id && credit.status === "available",
     );
     if (!freshlyListedCredit) {
-      return { parsed, listing: freshListing, audit: priorAudit };
+      return {
+        parsed,
+        listing: freshListing,
+        audit: freshReconciliation ?? priorAudit ?? reconciledAudit,
+      };
     }
 
     const freshParsed = await this.fetchLiveUsage(auth);
+    const eligibilityAtAttempt = new Date();
     const finalEligibility = this.checkRedemptionEligibility(
       freshParsed.payload,
       freshlyListedCredit,
-      new Date(),
+      eligibilityAtAttempt,
     );
     if (!finalEligibility.eligible) {
-      return { parsed: freshParsed, listing: freshListing, audit: priorAudit };
+      return {
+        parsed: freshParsed,
+        listing: freshListing,
+        audit: priorAudit ?? freshReconciliation ?? reconciledAudit,
+      };
     }
 
     const planned =
       priorAudit ??
-      this.store.planRedemption(candidate.id, crypto.randomUUID(), new Date().toISOString());
-    const audit = await this.consumeCredit(planned, auth);
+      this.store.planRedemption(
+        candidate.id,
+        crypto.randomUUID(),
+        eligibilityAtAttempt.toISOString(),
+        freshlyListedCredit.expiresAt!,
+      );
+    const audit = await this.consumeCredit(planned, auth, freshlyListedCredit);
     return { parsed: freshParsed, listing: freshListing, audit };
+  }
+
+  private reconcileOpenRedemptions(credits: ResetCredit[], now: Date): RedemptionAudit | null {
+    let reconciled: RedemptionAudit | null = null;
+    for (const audit of this.store.getOpenRedemptionAudits()) {
+      const credit = credits.find((item) => item.id === audit.creditId);
+      if (!credit) continue;
+      if (credit.status === "redeemed") {
+        reconciled = this.store.finishRedemption(
+          audit.id,
+          "final",
+          now.toISOString(),
+          "already_redeemed",
+          "A fresh provider listing confirms that the credit is redeemed; no replay was sent.",
+        );
+        continue;
+      }
+      const expiry = Date.parse(credit.expiresAt ?? audit.expiresAt ?? "");
+      if (credit.status === "expired" || (Number.isFinite(expiry) && expiry <= now.getTime())) {
+        reconciled = this.store.finishRedemption(
+          audit.id,
+          "final",
+          now.toISOString(),
+          audit.attemptCount > 0 ? "expired_unresolved" : "expired",
+          audit.attemptCount > 0
+            ? "The authoritative expiry passed without provider confirmation that redemption succeeded."
+            : "The authoritative expiry passed before a consume request was sent.",
+        );
+      }
+    }
+    return reconciled;
   }
 
   private checkRedemptionEligibility(
@@ -404,7 +488,7 @@ export class UsageCollector {
       return { eligible: false, reason: "The reset credit is not listed as available." };
     }
     if (!credit.expiresAt) {
-      return { eligible: false, reason: "The reset credit has no parseable expiry." };
+      return { eligible: false, reason: "The reset credit has no parseable exact expiry." };
     }
     const expiresAt = Date.parse(credit.expiresAt);
     if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
@@ -437,9 +521,24 @@ export class UsageCollector {
     };
   }
 
-  private async consumeCredit(audit: RedemptionAudit, auth: LiveAuth): Promise<RedemptionAudit> {
-    const attemptedAt = new Date().toISOString();
-    const inFlight = this.store.markRedemptionInFlight(audit.id, attemptedAt);
+  private async consumeCredit(
+    audit: RedemptionAudit,
+    auth: LiveAuth,
+    credit: ResetCredit,
+  ): Promise<RedemptionAudit> {
+    const attemptedAt = new Date();
+    const expiry = Date.parse(credit.expiresAt ?? audit.expiresAt ?? "");
+    if (!Number.isFinite(expiry) || expiry <= attemptedAt.getTime()) {
+      return this.store.finishRedemption(
+        audit.id,
+        "final",
+        attemptedAt.toISOString(),
+        "expired",
+        "The authoritative expiry passed before a consume request could be sent.",
+      );
+    }
+
+    const inFlight = this.store.markRedemptionInFlight(audit.id, attemptedAt.toISOString());
     const endpoint = deriveCreditEndpoint(this.config.usageEndpoint, true);
     const headers = buildAuthHeaders(auth);
     headers.set("Content-Type", "application/json");
@@ -459,12 +558,11 @@ export class UsageCollector {
         signal: AbortSignal.timeout(this.config.requestTimeoutMilliseconds),
       });
     } catch {
-      return this.store.finishRedemption(
-        inFlight.id,
-        "ambiguous",
-        new Date().toISOString(),
-        "unknown",
-        "The consume request had a transport failure or timeout, so its result is ambiguous and automatic retry is prohibited.",
+      return this.deferAmbiguousRedemption(
+        inFlight,
+        credit,
+        null,
+        "The consume request had a transport failure or timeout, so the same durable idempotency key may be replayed after fresh provider-state reconciliation.",
       );
     }
 
@@ -479,6 +577,9 @@ export class UsageCollector {
         redemptionOutcomeReason(outcome),
       );
     }
+    if (outcome === "nothing_to_reset") {
+      return this.deferConfirmedNoop(inFlight, credit);
+    }
     if (response.status === 401 || response.status === 403) {
       return this.store.finishRedemption(
         inFlight.id,
@@ -488,13 +589,19 @@ export class UsageCollector {
         "The provider rejected authorization; no automatic retry will be attempted.",
       );
     }
-    if (response.status >= 500 || response.ok) {
-      return this.store.finishRedemption(
-        inFlight.id,
-        "ambiguous",
-        new Date().toISOString(),
-        "unknown",
-        "The provider response did not prove whether the credit was consumed; automatic retry is prohibited.",
+    if (
+      response.status === 408 ||
+      response.status === 409 ||
+      response.status === 425 ||
+      response.status === 429 ||
+      response.status >= 500 ||
+      response.ok
+    ) {
+      return this.deferAmbiguousRedemption(
+        inFlight,
+        credit,
+        retryAfterSeconds(response.headers.get("Retry-After"), new Date()),
+        `The provider returned HTTP ${response.status} without proving whether the credit was consumed; any retry will reuse the same durable idempotency key.`,
       );
     }
     return this.store.finishRedemption(
@@ -504,6 +611,64 @@ export class UsageCollector {
       "rejected",
       `The provider rejected the consume request with HTTP ${response.status}; no automatic retry will be attempted.`,
     );
+  }
+
+  private deferAmbiguousRedemption(
+    audit: RedemptionAudit,
+    credit: ResetCredit,
+    retryAfter: number | null,
+    reason: string,
+  ): RedemptionAudit {
+    const now = new Date();
+    const nextRetryAt = this.nextRedemptionRetryAt(audit, credit, now, retryAfter);
+    return this.store.finishRedemption(
+      audit.id,
+      "ambiguous",
+      now.toISOString(),
+      "unknown",
+      nextRetryAt
+        ? `${reason} The next automatic attempt is no earlier than ${nextRetryAt}.`
+        : `${reason} No further automatic attempt fits before the authoritative expiry or retry limit.`,
+      nextRetryAt,
+    );
+  }
+
+  private deferConfirmedNoop(audit: RedemptionAudit, credit: ResetCredit): RedemptionAudit {
+    const now = new Date();
+    const nextRetryAt = this.nextRedemptionRetryAt(audit, credit, now, null);
+    if (!nextRetryAt) {
+      return this.store.finishRedemption(
+        audit.id,
+        "final",
+        now.toISOString(),
+        "nothing_to_reset",
+        "OpenAI confirmed that no eligible usage was reset, and no further bounded retry fits before expiry.",
+      );
+    }
+    return this.store.renewRedemptionPlan(
+      audit.id,
+      crypto.randomUUID(),
+      nextRetryAt,
+      `OpenAI confirmed that no usage was reset. A new idempotency key is durably planned for the next eligibility check no earlier than ${nextRetryAt}.`,
+    );
+  }
+
+  private nextRedemptionRetryAt(
+    audit: RedemptionAudit,
+    credit: ResetCredit,
+    now: Date,
+    retryAfter: number | null,
+  ): string | null {
+    if (audit.attemptCount >= MAX_AUTOMATIC_REDEMPTION_ATTEMPTS) return null;
+    const expiry = Date.parse(credit.expiresAt ?? audit.expiresAt ?? "");
+    if (!Number.isFinite(expiry) || expiry <= now.getTime()) return null;
+    const delaySeconds = Math.max(
+      MIN_REDEMPTION_RETRY_SECONDS,
+      this.config.intervalSeconds,
+      retryAfter ?? 0,
+    );
+    const retryAt = now.getTime() + delaySeconds * 1_000;
+    return retryAt < expiry ? new Date(retryAt).toISOString() : null;
   }
 
   private async readLiveAuth(): Promise<LiveAuth> {
@@ -1076,15 +1241,28 @@ function redemptionOutcomeReason(outcome: string): string {
     case "no_credit":
       return "OpenAI confirmed that no consumable reset credit was available.";
     default:
-      return "OpenAI confirmed that there was no eligible usage to reset.";
+      return "OpenAI returned a final redemption outcome.";
   }
 }
 
-function selectEarliestAvailableCredit(credits: ResetCredit[], now: Date): ResetCredit | null {
+function retryAfterSeconds(value: string | null, now: Date): number | null {
+  if (!value) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric);
+  const at = Date.parse(value);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, Math.ceil((at - now.getTime()) / 1_000));
+}
+
+function selectEarliestAvailableCredit(
+  credits: ResetCredit[],
+  now: Date,
+  include: (credit: ResetCredit) => boolean = () => true,
+): ResetCredit | null {
   let selected: ResetCredit | null = null;
   let selectedTime = Number.POSITIVE_INFINITY;
   for (const credit of credits) {
-    if (credit.status !== "available" || !credit.expiresAt) continue;
+    if (credit.status !== "available" || !credit.expiresAt || !include(credit)) continue;
     const expiry = Date.parse(credit.expiresAt);
     if (!Number.isFinite(expiry) || expiry <= now.getTime()) continue;
     if (expiry < selectedTime) {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ const realFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  setSystemTime();
   delete process.env.ADMIN_TOKEN;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -38,7 +39,7 @@ function collectorConfig(overrides: Partial<CollectorConfig> = {}): CollectorCon
     backoffBaseSeconds: 30,
     backoffMaximumSeconds: 900,
     autoRedeem: false,
-    autoRedeemHorizonHours: 12,
+    autoRedeemHorizonHours: 1,
     maximumReportAgeSeconds: 600,
     ...overrides,
   };
@@ -76,7 +77,7 @@ describe("provider normalization", () => {
       }],
       resetCredits: {
         availableCount: 1,
-        credits: [{ status: "available", expiresAt: "2026-09-21T00:19:09.361Z" }],
+        credits: [{ status: "available", expiresAt: "2026-09-20T13:19:09.361-07:00" }],
       },
       metadata: { planType: "pro", email: "must-not-persist@example.invalid", accountId: "must-not-persist" },
     }, "2026-09-09T02:00:01Z", true);
@@ -91,7 +92,7 @@ describe("provider normalization", () => {
       windowSeconds: 18_000,
     }]);
     expect(parsed.payload.resetCreditsAvailableCount).toBe(1);
-    expect(parsed.embeddedCredits[0]?.expiresAt).toBe("2026-09-21T00:19:09.361Z");
+    expect(parsed.embeddedCredits[0]?.expiresAt).toBe("2026-09-20T20:19:09.361Z");
   });
 });
 
@@ -475,127 +476,50 @@ describe("history and pace", () => {
   });
 });
 
-describe("saved-reset safety", () => {
-  test("persists one idempotency key and never automatically retries an ambiguous consume", async () => {
-    const root = scratch();
-    const tokenPath = join(root, "token");
-    writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
-    chmodSync(tokenPath, 0o600);
-    const store = new DatabaseStore(join(root, "usage.sqlite"));
-    const now = Date.now();
-    const credit = { id: "RateLimitResetCredit_test", status: "available", expires_at: new Date(now + 2 * 3_600_000).toISOString() };
-    const usage = {
+interface SavedResetHarness {
+  store: DatabaseStore;
+  tokenPath: string;
+  credit: { id: string; status: string; expires_at: string };
+  usage: Record<string, unknown>;
+  now: number;
+}
+
+function savedResetHarness(
+  at = "2026-09-20T12:00:00.000Z",
+  expiryOffsetMilliseconds = 3_600_000,
+): SavedResetHarness {
+  const now = Date.parse(at);
+  setSystemTime(new Date(now));
+  const root = scratch();
+  const tokenPath = join(root, "token");
+  writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
+  chmodSync(tokenPath, 0o600);
+  return {
+    store: new DatabaseStore(join(root, "usage.sqlite")),
+    tokenPath,
+    credit: {
+      id: "RateLimitResetCredit_test",
+      status: "available",
+      expires_at: new Date(now + expiryOffsetMilliseconds).toISOString(),
+    },
+    usage: {
       plan_type: "pro",
       rate_limit: {
         primary_window: {
           used_percent: 30,
           limit_window_seconds: 18_000,
-          reset_at: Math.floor((now + 3_600_000) / 1_000),
+          reset_at: Math.floor((now + 7_200_000) / 1_000),
         },
       },
       rate_limit_reset_credits: { available_count: 1 },
-    };
-    let consumeCalls = 0;
-    let requestId: string | null = null;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url.endsWith("/consume")) {
-        consumeCalls += 1;
-        const body = JSON.parse(String(init?.body));
-        requestId = body.redeem_request_id;
-        throw new TypeError("simulated response loss");
-      }
-      if (url.endsWith("rate-limit-reset-credits")) {
-        return Response.json({ available_count: 1, credits: [credit] });
-      }
-      return Response.json(usage);
-    }) as typeof fetch;
+    },
+    now,
+  };
+}
 
-    const collector = new UsageCollector(store, collectorConfig({
-      mode: "live",
-      tokenFile: tokenPath,
-      autoRedeem: true,
-    }));
-    const first = await collector.collect();
-    const second = await collector.collect();
-    expect(first.redemptionAudit?.state).toBe("ambiguous");
-    expect(first.redemptionAudit?.redeemRequestId).toBe(requestId);
-    expect(second.redemptionAudit?.redeemRequestId).toBe(requestId);
-    expect(consumeCalls).toBe(1);
-    expect(store.getLatestAudit()?.state).toBe("ambiguous");
-    store.close();
-  });
-  test("attempts an in-horizon available credit even when regular usage is zero", async () => {
-    const root = scratch();
-    const tokenPath = join(root, "token");
-    writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
-    chmodSync(tokenPath, 0o600);
-    const store = new DatabaseStore(join(root, "usage.sqlite"));
-    const now = Date.now();
-    const credit = {
-      id: "RateLimitResetCredit_zero_usage",
-      status: "available",
-      expires_at: new Date(now + 2 * 3_600_000).toISOString(),
-    };
-    const usage = {
-      plan_type: "pro",
-      rate_limit: {
-        primary_window: {
-          used_percent: 0,
-          limit_window_seconds: 18_000,
-          reset_at: Math.floor((now + 3_600_000) / 1_000),
-        },
-      },
-      rate_limit_reset_credits: { available_count: 1 },
-    };
-    let consumeCalls = 0;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/consume")) {
-        consumeCalls += 1;
-        return Response.json({ status: "nothing_to_reset" });
-      }
-      if (url.endsWith("rate-limit-reset-credits")) {
-        return Response.json({ available_count: 1, credits: [credit] });
-      }
-      return Response.json(usage);
-    }) as typeof fetch;
-
-    const collector = new UsageCollector(store, collectorConfig({
-      mode: "live",
-      tokenFile: tokenPath,
-      autoRedeem: true,
-    }));
-    const result = await collector.collect();
-    expect(result.redemptionAudit?.state).toBe("final");
-    expect(result.redemptionAudit?.outcome).toBe("nothing_to_reset");
-    expect(consumeCalls).toBe(1);
-    store.close();
-  });
-
-  test("does not attempt an available credit outside the expiry horizon", async () => {
-    const root = scratch();
-    const tokenPath = join(root, "token");
-    writeFileSync(tokenPath, "opaque-test-token\n", { mode: 0o600 });
-    chmodSync(tokenPath, 0o600);
-    const store = new DatabaseStore(join(root, "usage.sqlite"));
-    const now = Date.now();
-    const credit = {
-      id: "RateLimitResetCredit_not_expiring",
-      status: "available",
-      expires_at: new Date(now + 13 * 3_600_000).toISOString(),
-    };
-    const usage = {
-      plan_type: "pro",
-      rate_limit: {
-        primary_window: {
-          used_percent: 0,
-          limit_window_seconds: 18_000,
-          reset_at: Math.floor((now + 3_600_000) / 1_000),
-        },
-      },
-      rate_limit_reset_credits: { available_count: 1 },
-    };
+describe("saved-reset safety", () => {
+  test("activates at the exact one-hour boundary, not one millisecond before it", async () => {
+    const scenario = savedResetHarness(undefined, 3_600_001);
     let consumeCalls = 0;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -604,20 +528,179 @@ describe("saved-reset safety", () => {
         return Response.json({ status: "reset" });
       }
       if (url.endsWith("rate-limit-reset-credits")) {
-        return Response.json({ available_count: 1, credits: [credit] });
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
       }
-      return Response.json(usage);
+      return Response.json(scenario.usage);
     }) as typeof fetch;
-
-    const collector = new UsageCollector(store, collectorConfig({
+    const collector = new UsageCollector(scenario.store, collectorConfig({
       mode: "live",
-      tokenFile: tokenPath,
+      tokenFile: scenario.tokenPath,
       autoRedeem: true,
     }));
-    const result = await collector.collect();
-    expect(result.redemptionAudit).toBeNull();
-    expect(store.getLatestAudit()).toBeNull();
+
+    expect((await collector.collect()).redemptionAudit).toBeNull();
     expect(consumeCalls).toBe(0);
-    store.close();
+    scenario.credit.expires_at = new Date(scenario.now + 3_600_000).toISOString();
+    const atBoundary = await collector.collect();
+    expect(atBoundary.redemptionAudit?.state).toBe("final");
+    expect(atBoundary.redemptionAudit?.outcome).toBe("reset");
+    expect(consumeCalls).toBe(1);
+    scenario.store.close();
+  });
+
+  test("never sends a consume request at or after the authoritative expiry", async () => {
+    const scenario = savedResetHarness(undefined, 0);
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    expect((await collector.collect()).redemptionAudit).toBeNull();
+    expect(consumeCalls).toBe(0);
+    scenario.store.close();
+  });
+
+  test("retries a transient failure on the polling cadence with the same idempotency key", async () => {
+    const scenario = savedResetHarness();
+    const requestIds: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        requestIds.push(JSON.parse(String(init?.body)).redeem_request_id);
+        return requestIds.length === 1
+          ? Response.json({ status: "temporarily_unavailable" }, { status: 503 })
+          : Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const first = await collector.collect();
+    expect(first.redemptionAudit?.state).toBe("ambiguous");
+    expect(first.redemptionAudit?.nextRetryAt).toBe("2026-09-20T12:05:00.000Z");
+    expect((await collector.collect()).redemptionAudit?.state).toBe("ambiguous");
+    expect(requestIds).toHaveLength(1);
+    setSystemTime(new Date(scenario.now + 300_000));
+    const recovered = await collector.collect();
+    expect(recovered.redemptionAudit?.outcome).toBe("reset");
+    expect(recovered.redemptionAudit?.attemptCount).toBe(2);
+    expect(requestIds).toEqual([requestIds[0], requestIds[0]]);
+    scenario.store.close();
+  });
+
+  test("rechecks a confirmed no-op with a new key and succeeds before expiry", async () => {
+    const scenario = savedResetHarness();
+    const requestIds: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        requestIds.push(JSON.parse(String(init?.body)).redeem_request_id);
+        return Response.json({ status: requestIds.length === 1 ? "nothing_to_reset" : "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const first = await collector.collect();
+    expect(first.redemptionAudit?.state).toBe("planned");
+    expect(first.redemptionAudit?.outcome).toBe("nothing_to_reset");
+    setSystemTime(new Date(scenario.now + 300_000));
+    expect((await collector.collect()).redemptionAudit?.outcome).toBe("reset");
+    expect(requestIds).toHaveLength(2);
+    expect(requestIds[1]).not.toBe(requestIds[0]);
+    scenario.store.close();
+  });
+
+  test("reconciles an ambiguous response as redeemed without a duplicate consume", async () => {
+    const scenario = savedResetHarness();
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        throw new TypeError("simulated response loss");
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({
+          available_count: scenario.credit.status === "available" ? 1 : 0,
+          credits: [scenario.credit],
+        });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    expect((await collector.collect()).redemptionAudit?.state).toBe("ambiguous");
+    scenario.credit.status = "redeemed";
+    setSystemTime(new Date(scenario.now + 300_000));
+    const reconciled = await collector.collect();
+    expect(reconciled.redemptionAudit?.state).toBe("final");
+    expect(reconciled.redemptionAudit?.outcome).toBe("already_redeemed");
+    expect(consumeCalls).toBe(1);
+    scenario.store.close();
+  });
+
+  test("honors Retry-After before replaying the same idempotency key", async () => {
+    const scenario = savedResetHarness();
+    const requestIds: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        requestIds.push(JSON.parse(String(init?.body)).redeem_request_id);
+        return requestIds.length === 1
+          ? new Response(null, { status: 429, headers: { "Retry-After": "600" } })
+          : Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const limited = await collector.collect();
+    expect(limited.redemptionAudit?.nextRetryAt).toBe("2026-09-20T12:10:00.000Z");
+    setSystemTime(new Date(scenario.now + 300_000));
+    await collector.collect();
+    expect(requestIds).toHaveLength(1);
+    setSystemTime(new Date(scenario.now + 600_000));
+    expect((await collector.collect()).redemptionAudit?.outcome).toBe("reset");
+    expect(requestIds).toEqual([requestIds[0], requestIds[0]]);
+    scenario.store.close();
   });
 });

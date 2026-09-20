@@ -88,7 +88,7 @@ The bind-mounted `data` directory contains the indefinite SQLite history, the ow
 | `ADMIN_TOKEN` | unset | Server-only bearer for an explicit collection trigger; unset disables it |
 | `VAPID_FILE` | unset | Optional owner-only (`0600`), service-user-owned JSON VAPID key file; unset disables Web Push |
 | `AUTO_REDEEM` | `false` | Enable expiry-salvage evaluation and consumption |
-| `AUTO_REDEEM_HORIZON_HOURS` | `12` | Credit must expire within this horizon |
+| `AUTO_REDEEM_HORIZON_HOURS` | `1` | Credit must be at or inside this many hours before its exact posted expiry |
 
 Collection failures use bounded exponential backoff and never erase the last good observation. With a dedicated OAuth file, an expiring token is refreshed proactively and a 401/403 receives exactly one refresh-and-retry attempt. Invalid grants or account-context changes become `auth_failed` and require a new dedicated device authorization; transient failures become `error` and eventually `stale` while history remains available.
 
@@ -105,14 +105,16 @@ Preferences, per-cycle baselines, and delivery cursors are durable per subscript
 Automatic redemption is off by default. When enabled, the collector:
 
 1. requires a fresh live usage report no more than ten minutes old;
-2. live-lists credits and selects the available one with the earliest parseable expiry;
-3. requires the credit to expire within the configured horizon, regardless of whether any regular or Spark allowance has been consumed;
-4. re-fetches both the credit listing and usage report immediately before the attempt;
-5. commits a durable credit-specific idempotency key before sending exactly one consume request;
-6. records `reset`, provider no-op such as `nothing_to_reset`, failure, or ambiguous transport state; and
-7. never automatically retries an ambiguous consume.
+2. live-lists credits and selects the available one with the earliest exact, parseable, timezone-aware `expires_at`;
+3. starts attempting only at or inside the configured horizon before that authoritative instant, regardless of whether any regular or Spark allowance has been consumed;
+4. re-fetches both the credit listing and usage report immediately before each attempt;
+5. commits a durable credit-specific idempotency key before sending a consume request;
+6. records provider-confirmed `reset`, `already_redeemed`, `no_credit`, or `nothing_to_reset` outcomes without treating stale or missing data as success;
+7. reconciles an uncertain outcome against a fresh provider listing, and replays only the same idempotency key while the credit is still listed available;
+8. retries transient or ambiguous outcomes no sooner than the larger of the normal collection interval (five minutes by default), 60 seconds, or `Retry-After`, with at most 12 attempts and never at or after expiry; and
+9. treats a confirmed `nothing_to_reset` as a safe eligibility delay, durably planning a new idempotency key for a later poll because the provider proved the prior request consumed nothing.
 
-This follows the provider's `redeem_request_id` idempotency contract while preferring duplicate safety. It never buys credits, enables auto-reload, changes a plan, or spends a reset merely for testing. The browser has no unauthenticated redemption endpoint and receives no operator token.
+If the provider omits or publishes an unparseable exact expiry, the conservative fallback is observation only: the credit remains visible where possible, but automatic redemption does not estimate a date or send a consume request. Polling means the first attempt occurs on the first successful collection at or inside the one-hour window, not at the exact boundary second. This follows the provider's `redeem_request_id` idempotency contract while avoiding duplicate consumption. It never buys credits, enables auto-reload, changes a plan, or spends a reset merely for testing. The browser has no unauthenticated redemption endpoint and receives no operator token.
 
 ## Data semantics and limitations
 

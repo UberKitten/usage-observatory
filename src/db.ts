@@ -150,6 +150,11 @@ const MIGRATIONS = [
       updated_at TEXT NOT NULL
     );
   `,
+  `
+    ALTER TABLE redemption_audit ADD COLUMN expires_at TEXT;
+    ALTER TABLE redemption_audit ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE redemption_audit ADD COLUMN next_retry_at TEXT;
+  `,
 ] as const;
 
 interface SourceStatusRow {
@@ -231,6 +236,9 @@ interface AuditRow {
   finalized_at: string | null;
   outcome: string | null;
   reason: string | null;
+  expires_at: string | null;
+  attempt_count: number;
+  next_retry_at: string | null;
 }
 
 interface PushSubscriptionRow {
@@ -1195,7 +1203,12 @@ export class DatabaseStore {
       );
   }
 
-  planRedemption(creditId: string, redeemRequestId: string, plannedAt: string): RedemptionAudit {
+  planRedemption(
+    creditId: string,
+    redeemRequestId: string,
+    plannedAt: string,
+    expiresAt: string,
+  ): RedemptionAudit {
     const existing = this.database
       .query<AuditRow, [string]>("SELECT * FROM redemption_audit WHERE credit_id = ?")
       .get(creditId);
@@ -1204,10 +1217,16 @@ export class DatabaseStore {
     this.database
       .query(
         `INSERT INTO redemption_audit(
-           credit_id, redeem_request_id, state, planned_at, reason
-         ) VALUES (?, ?, 'planned', ?, ?)`,
+           credit_id, redeem_request_id, state, planned_at, expires_at, reason
+         ) VALUES (?, ?, 'planned', ?, ?, ?)`,
       )
-      .run(creditId, redeemRequestId, plannedAt, "Eligibility was established; no consume request has been sent yet.");
+      .run(
+        creditId,
+        redeemRequestId,
+        plannedAt,
+        expiresAt,
+        "Eligibility was established; no consume request has been sent yet.",
+      );
     return this.getAuditByCreditId(creditId)!;
   }
 
@@ -1215,7 +1234,8 @@ export class DatabaseStore {
     this.database
       .query(
         `UPDATE redemption_audit
-            SET state = 'in_flight', attempted_at = ?, outcome = NULL,
+            SET state = 'in_flight', attempted_at = ?, finalized_at = NULL,
+                outcome = NULL, next_retry_at = NULL, attempt_count = attempt_count + 1,
                 reason = 'Consume request may have been sent; completion is not yet known.'
           WHERE id = ? AND state IN ('planned', 'ambiguous')`,
       )
@@ -1229,14 +1249,32 @@ export class DatabaseStore {
     finalizedAt: string,
     outcome: string,
     reason: string,
+    nextRetryAt: string | null = null,
   ): RedemptionAudit {
     this.database
       .query(
         `UPDATE redemption_audit
-            SET state = ?, finalized_at = ?, outcome = ?, reason = ?
+            SET state = ?, finalized_at = ?, outcome = ?, reason = ?, next_retry_at = ?
           WHERE id = ?`,
       )
-      .run(state, finalizedAt, outcome, reason, id);
+      .run(state, finalizedAt, outcome, reason, nextRetryAt, id);
+    return this.getAuditById(id)!;
+  }
+
+  renewRedemptionPlan(
+    id: number,
+    redeemRequestId: string,
+    nextRetryAt: string,
+    reason: string,
+  ): RedemptionAudit {
+    this.database
+      .query(
+        `UPDATE redemption_audit
+            SET state = 'planned', redeem_request_id = ?, finalized_at = NULL,
+                outcome = 'nothing_to_reset', reason = ?, next_retry_at = ?
+          WHERE id = ? AND state = 'in_flight'`,
+      )
+      .run(redeemRequestId, reason, nextRetryAt, id);
     return this.getAuditById(id)!;
   }
 
@@ -1254,6 +1292,15 @@ export class DatabaseStore {
     return row ? mapAudit(row) : null;
   }
 
+  getOpenRedemptionAudits(): RedemptionAudit[] {
+    return this.database
+      .query<AuditRow, []>(
+        "SELECT * FROM redemption_audit WHERE state != 'final' ORDER BY id",
+      )
+      .all()
+      .map(mapAudit);
+  }
+
   getLatestAudit(): RedemptionAudit | null {
     const row = this.database
       .query<AuditRow, []>("SELECT * FROM redemption_audit ORDER BY id DESC LIMIT 1")
@@ -1267,7 +1314,8 @@ export class DatabaseStore {
       .query(
         `UPDATE redemption_audit
             SET state = 'ambiguous', finalized_at = ?, outcome = 'unknown',
-                reason = 'The process stopped while the consume request was in flight; automatic retry is prohibited.'
+                next_retry_at = NULL,
+                reason = 'The process stopped while the consume request was in flight; a retry may use the same durable idempotency key after fresh provider-state reconciliation.'
           WHERE state = 'in_flight'`,
       )
       .run(at);
@@ -1344,5 +1392,8 @@ function mapAudit(row: AuditRow): RedemptionAudit {
     finalizedAt: row.finalized_at,
     outcome: row.outcome,
     reason: row.reason,
+    expiresAt: row.expires_at,
+    attemptCount: row.attempt_count,
+    nextRetryAt: row.next_retry_at,
   };
 }

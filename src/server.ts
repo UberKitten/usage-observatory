@@ -424,6 +424,8 @@ function buildBankedReset(
   const thresholds = {
     expiryHorizonHours: policy.expiryHorizonHours,
     maximumReportAgeSeconds: policy.maximumReportAgeSeconds,
+    retryIntervalSeconds: policy.retryIntervalSeconds,
+    maximumAttempts: policy.maximumAttempts,
   };
   const lastActionAt = audit?.finalizedAt ?? audit?.attemptedAt ?? audit?.plannedAt ?? null;
 
@@ -488,7 +490,7 @@ function buildBankedReset(
     expiresAt: observation.resetCredits.earliestExpiresAt,
     lastActionAt: null,
     reason: policy.enabled
-      ? `Automatic salvage attempts every live-listed, dated, unexpired credit within ${policy.expiryHorizonHours} hours when the usage report is no older than ${policy.maximumReportAgeSeconds} seconds. Allowance consumption does not suppress an expiring-credit attempt.`
+      ? `Automatic salvage starts on the first successful poll at or inside ${policy.expiryHorizonHours} hour before the exact posted expiry. Retry checks are no sooner than ${policy.retryIntervalSeconds} seconds apart, honor longer provider Retry-After values, stop after ${policy.maximumAttempts} attempts, and never run at or after expiry. Allowance consumption does not suppress an expiring-credit attempt.`
       : "Automatic redemption is disabled by default. Reset credits are observable, but no public redemption endpoint is exposed.",
     availableCount: observation.resetCredits.availableCount,
     autoRedeemEnabled: policy.enabled,
