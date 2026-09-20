@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { UsageCollector, normalizeUsagePayload, type CollectorConfig } from "../src/collector";
 import { DatabaseStore } from "../src/db";
 import { buildPace, createRequestHandler } from "../src/server";
@@ -94,6 +94,33 @@ describe("provider normalization", () => {
     expect(parsed.payload.resetCreditsAvailableCount).toBe(1);
     expect(parsed.embeddedCredits[0]?.expiresAt).toBe("2026-09-20T20:19:09.361Z");
   });
+  test("rejects a timezone-less credit expiry instead of inferring the host timezone", () => {
+    const fetchedAt = Date.parse("2026-09-20T12:00:00Z");
+    const parsed = normalizeUsagePayload({
+      provider: "openai-codex",
+      fetchedAt,
+      limits: [{
+        id: "openai-codex:primary",
+        amount: { used: 20 },
+        window: { resetsAt: fetchedAt + 18_000_000 },
+      }],
+      resetCredits: {
+        availableCount: 1,
+        credits: [{
+          id: "RateLimitResetCredit_without_timezone",
+          status: "available",
+          expiresAt: "2026-09-20T13:00:00",
+        }],
+      },
+    }, "2026-09-20T12:00:00Z", true);
+
+    expect(parsed.embeddedCredits).toEqual([{
+      id: "RateLimitResetCredit_without_timezone",
+      status: "available",
+      expiresAt: null,
+    }]);
+  });
+
 });
 
 describe("history and pace", () => {
@@ -702,5 +729,75 @@ describe("saved-reset safety", () => {
     expect((await collector.collect()).redemptionAudit?.outcome).toBe("reset");
     expect(requestIds).toEqual([requestIds[0], requestIds[0]]);
     scenario.store.close();
+  });
+  test("does not bypass a Retry-After deadline that extends beyond expiry", async () => {
+    const scenario = savedResetHarness(undefined, 50 * 60_000);
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        return new Response(null, { status: 429, headers: { "Retry-After": "3600" } });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const limited = await collector.collect();
+    expect(limited.redemptionAudit?.nextRetryAt).toBe("2026-09-20T13:00:00.000Z");
+    setSystemTime(new Date(scenario.now + 45 * 60_000));
+    await collector.collect();
+    expect(consumeCalls).toBe(1);
+    setSystemTime(new Date(scenario.now + 50 * 60_000));
+    const expired = await collector.collect();
+    expect(expired.redemptionAudit?.outcome).toBe("expired_unresolved");
+    expect(consumeCalls).toBe(1);
+    scenario.store.close();
+  });
+
+  test("waits one polling interval before replaying a crash-interrupted request", async () => {
+    const scenario = savedResetHarness();
+    const expiry = scenario.credit.expires_at;
+    const planned = scenario.store.planRedemption(
+      scenario.credit.id,
+      "crash-stable-request-id",
+      new Date(scenario.now).toISOString(),
+      expiry,
+    );
+    scenario.store.markRedemptionInFlight(planned.id, new Date(scenario.now).toISOString());
+    scenario.store.close();
+    setSystemTime(new Date(scenario.now + 1_000));
+    const recoveredStore = new DatabaseStore(join(dirname(scenario.tokenPath), "usage.sqlite"));
+    const requestIds: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        requestIds.push(JSON.parse(String(init?.body)).redeem_request_id);
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(recoveredStore, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    expect((await collector.collect()).redemptionAudit?.state).toBe("ambiguous");
+    expect(requestIds).toHaveLength(0);
+    setSystemTime(new Date(scenario.now + 300_000));
+    expect((await collector.collect()).redemptionAudit?.outcome).toBe("reset");
+    expect(requestIds).toEqual(["crash-stable-request-id"]);
+    recoveredStore.close();
   });
 });

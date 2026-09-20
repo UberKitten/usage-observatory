@@ -398,7 +398,15 @@ export class UsageCollector {
         );
         return { parsed, listing: { supported: true, known: true, credits }, audit: priorAudit };
       }
-      const nextRetryAt = priorAudit.nextRetryAt ? Date.parse(priorAudit.nextRetryAt) : Number.NaN;
+      let nextRetryAt = priorAudit.nextRetryAt ? Date.parse(priorAudit.nextRetryAt) : Number.NaN;
+      if (!Number.isFinite(nextRetryAt) && priorAudit.state === "ambiguous" && priorAudit.attemptedAt) {
+        const interruptedAt = Date.parse(priorAudit.attemptedAt);
+        if (Number.isFinite(interruptedAt)) {
+          nextRetryAt =
+            interruptedAt +
+            Math.max(MIN_REDEMPTION_RETRY_SECONDS, this.config.intervalSeconds) * 1_000;
+        }
+      }
       if (Number.isFinite(nextRetryAt) && nextRetryAt > now.getTime()) {
         return { parsed, listing: { supported: true, known: true, credits }, audit: priorAudit };
       }
@@ -636,7 +644,9 @@ export class UsageCollector {
   private deferConfirmedNoop(audit: RedemptionAudit, credit: ResetCredit): RedemptionAudit {
     const now = new Date();
     const nextRetryAt = this.nextRedemptionRetryAt(audit, credit, now, null);
-    if (!nextRetryAt) {
+    const retryAt = nextRetryAt ? Date.parse(nextRetryAt) : Number.NaN;
+    const expiry = Date.parse(credit.expiresAt ?? audit.expiresAt ?? "");
+    if (!Number.isFinite(retryAt) || !Number.isFinite(expiry) || retryAt >= expiry) {
       return this.store.finishRedemption(
         audit.id,
         "final",
@@ -668,7 +678,7 @@ export class UsageCollector {
       retryAfter ?? 0,
     );
     const retryAt = now.getTime() + delaySeconds * 1_000;
-    return retryAt < expiry ? new Date(retryAt).toISOString() : null;
+    return new Date(retryAt).toISOString();
   }
 
   private async readLiveAuth(): Promise<LiveAuth> {
@@ -1033,7 +1043,7 @@ function normalizeResetCredits(input: unknown, allowSyntheticIds = false): Reset
   for (const [index, value] of values.entries()) {
     if (!isRecord(value)) continue;
     const explicitId = typeof value.id === "string" ? value.id.trim() : "";
-    const expiresAt = normalizeTimestamp(value.expires_at ?? value.expiresAt);
+    const expiresAt = normalizeCreditExpiry(value.expires_at ?? value.expiresAt);
     const id =
       explicitId ||
       (allowSyntheticIds && expiresAt ? `reported-expiry:${expiresAt}:${index}` : "");
@@ -1287,6 +1297,18 @@ function windowLabel(key: string, windowSeconds: number | null): string {
   }
   if (key === "openai-codex:spark:primary") return "OpenAI Codex Spark primary window";
   return "OpenAI Codex Spark secondary window";
+}
+
+function normalizeCreditExpiry(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return normalizeTimestamp(value);
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (Number.isFinite(Number(trimmed))) return normalizeTimestamp(trimmed);
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed)) return null;
+  return normalizeTimestamp(trimmed);
 }
 
 function normalizeTimestamp(value: unknown): string | null {
