@@ -9,6 +9,7 @@ import type {
   PushPreferences,
   PushSubscriptionInput,
   RedemptionAuditState,
+  RedemptionInitiator,
   ResetCredit,
   SourceMode,
   SourceState,
@@ -155,6 +156,45 @@ const MIGRATIONS = [
     ALTER TABLE redemption_audit ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE redemption_audit ADD COLUMN next_retry_at TEXT;
   `,
+  `
+    ALTER TABLE redemption_audit RENAME TO redemption_audit_v5;
+    CREATE TABLE redemption_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      credit_id TEXT NOT NULL,
+      redeem_request_id TEXT NOT NULL UNIQUE,
+      state TEXT NOT NULL,
+      initiator TEXT NOT NULL CHECK (initiator IN ('automatic', 'manual')),
+      planned_at TEXT NOT NULL,
+      attempted_at TEXT,
+      finalized_at TEXT,
+      outcome TEXT,
+      reason TEXT,
+      expires_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT
+    );
+    INSERT INTO redemption_audit(
+      id, credit_id, redeem_request_id, state, initiator, planned_at,
+      attempted_at, finalized_at, outcome, reason, expires_at, attempt_count, next_retry_at
+    )
+    SELECT id, credit_id, redeem_request_id, state, 'automatic', planned_at,
+           attempted_at, finalized_at, outcome, reason, expires_at, attempt_count, next_retry_at
+      FROM redemption_audit_v5;
+    DROP TABLE redemption_audit_v5;
+    CREATE INDEX redemption_audit_state_idx
+      ON redemption_audit(state, id);
+    CREATE INDEX redemption_audit_credit_idx
+      ON redemption_audit(credit_id, id);
+
+    ALTER TABLE web_push_notification_state
+      ADD COLUMN last_redemption_audit_id INTEGER NOT NULL DEFAULT 0;
+    UPDATE web_push_notification_state
+       SET last_redemption_audit_id = COALESCE((
+         SELECT MAX(id)
+           FROM redemption_audit
+          WHERE state = 'final' AND initiator = 'automatic'
+       ), 0);
+  `,
 ] as const;
 
 interface SourceStatusRow {
@@ -231,6 +271,7 @@ interface AuditRow {
   credit_id: string;
   redeem_request_id: string;
   state: RedemptionAuditState;
+  initiator: RedemptionInitiator;
   planned_at: string;
   attempted_at: string | null;
   finalized_at: string | null;
@@ -265,6 +306,7 @@ interface PushNotificationStateRow {
   remaining_25_delivered: number;
   remaining_15_delivered: number;
   remaining_5_delivered: number;
+  last_redemption_audit_id: number;
   updated_at: string;
 }
 
@@ -813,6 +855,21 @@ export class DatabaseStore {
     }
   }
 
+  getResetCreditInventory(): ResetCredit[] {
+    return this.database
+      .query<{ credit_id: string; status: string; expires_at: string | null }, []>(
+        `SELECT credit_id, status, expires_at
+           FROM reset_credit_inventory
+          ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, credit_id`,
+      )
+      .all()
+      .map((row) => ({
+        id: row.credit_id,
+        status: row.status,
+        expiresAt: row.expires_at,
+      }));
+  }
+
   private getDerivedSeries(): DerivedSeries {
     if (this.derivedSeriesCache) return this.derivedSeriesCache;
 
@@ -1164,7 +1221,7 @@ export class DatabaseStore {
       .query<PushNotificationStateRow, [string]>(
         `SELECT endpoint, last_observation_id, pace_status, remaining_percent,
                 reset_at, remaining_25_delivered, remaining_15_delivered,
-                remaining_5_delivered, updated_at
+                remaining_5_delivered, last_redemption_audit_id, updated_at
            FROM web_push_notification_state
           WHERE endpoint = ?`,
       )
@@ -1178,8 +1235,8 @@ export class DatabaseStore {
         `INSERT INTO web_push_notification_state(
            endpoint, last_observation_id, pace_status, remaining_percent,
            reset_at, remaining_25_delivered, remaining_15_delivered,
-           remaining_5_delivered, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           remaining_5_delivered, last_redemption_audit_id, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(endpoint) DO UPDATE SET
            last_observation_id = excluded.last_observation_id,
            pace_status = excluded.pace_status,
@@ -1188,6 +1245,7 @@ export class DatabaseStore {
            remaining_25_delivered = excluded.remaining_25_delivered,
            remaining_15_delivered = excluded.remaining_15_delivered,
            remaining_5_delivered = excluded.remaining_5_delivered,
+           last_redemption_audit_id = excluded.last_redemption_audit_id,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -1199,6 +1257,7 @@ export class DatabaseStore {
         booleanInteger(state.remaining25Delivered),
         booleanInteger(state.remaining15Delivered),
         booleanInteger(state.remaining5Delivered),
+        state.lastRedemptionAuditId,
         state.updatedAt,
       );
   }
@@ -1208,26 +1267,25 @@ export class DatabaseStore {
     redeemRequestId: string,
     plannedAt: string,
     expiresAt: string,
+    initiator: RedemptionInitiator = "automatic",
   ): RedemptionAudit {
-    const existing = this.database
-      .query<AuditRow, [string]>("SELECT * FROM redemption_audit WHERE credit_id = ?")
-      .get(creditId);
-    if (existing) return mapAudit(existing);
-
     this.database
       .query(
         `INSERT INTO redemption_audit(
-           credit_id, redeem_request_id, state, planned_at, expires_at, reason
-         ) VALUES (?, ?, 'planned', ?, ?, ?)`,
+           credit_id, redeem_request_id, state, initiator, planned_at, expires_at, reason
+         ) VALUES (?, ?, 'planned', ?, ?, ?, ?)`,
       )
       .run(
         creditId,
         redeemRequestId,
+        initiator,
         plannedAt,
         expiresAt,
         "Eligibility was established; no consume request has been sent yet.",
       );
-    return this.getAuditByCreditId(creditId)!;
+    return this.getAuditById(Number(this.database.query<{ id: number }, []>(
+      "SELECT last_insert_rowid() AS id",
+    ).get()!.id))!;
   }
 
   markRedemptionInFlight(id: number, attemptedAt: string): RedemptionAudit {
@@ -1287,7 +1345,9 @@ export class DatabaseStore {
 
   getAuditByCreditId(creditId: string): RedemptionAudit | null {
     const row = this.database
-      .query<AuditRow, [string]>("SELECT * FROM redemption_audit WHERE credit_id = ?")
+      .query<AuditRow, [string]>(
+        "SELECT * FROM redemption_audit WHERE credit_id = ? ORDER BY id DESC LIMIT 1",
+      )
       .get(creditId);
     return row ? mapAudit(row) : null;
   }
@@ -1363,6 +1423,7 @@ function mapPushNotificationState(row: PushNotificationStateRow): PushNotificati
     remaining25Delivered: row.remaining_25_delivered === 1,
     remaining15Delivered: row.remaining_15_delivered === 1,
     remaining5Delivered: row.remaining_5_delivered === 1,
+    lastRedemptionAuditId: row.last_redemption_audit_id,
     updatedAt: row.updated_at,
   };
 }
@@ -1387,6 +1448,7 @@ function mapAudit(row: AuditRow): RedemptionAudit {
     creditId: row.credit_id,
     redeemRequestId: row.redeem_request_id,
     state: row.state,
+    initiator: row.initiator,
     plannedAt: row.planned_at,
     attemptedAt: row.attempted_at,
     finalizedAt: row.finalized_at,

@@ -445,6 +445,100 @@ describe("Web Push transition dispatch", () => {
     expect(store.getPushNotificationState(browserSubscription("gone").endpoint)).toBeNull();
     store.close();
   });
+
+  test("delivers automatic redemption finals once, persists the cursor before send, and baselines history", async () => {
+    const store = new DatabaseStore(join(scratch(), "redemptions.sqlite"));
+    const delivered: Array<{ payload: unknown; cursor: number }> = [];
+    const dependencies = {
+      send: async (subscription: { endpoint: string }, payload: string) => {
+        delivered.push({
+          payload: JSON.parse(payload),
+          cursor: store.getPushNotificationState(subscription.endpoint)!.lastRedemptionAuditId,
+        });
+      },
+      sleep: async () => {},
+    };
+    const notifications = new PushNotificationService(
+      store,
+      vapidConfiguration(),
+      () => pace("on_track"),
+      dependencies,
+    );
+    insert(store, 0, 10);
+    const subscription = browserSubscription("redemption");
+    notifications.subscribe(subscription);
+
+    const successPlan = store.planRedemption(
+      "credit-success",
+      "request-success",
+      "2026-09-01T00:00:00.000Z",
+      "2026-09-02T00:00:00.000Z",
+    );
+    const success = store.finishRedemption(
+      successPlan.id,
+      "final",
+      "2026-09-01T00:01:00.000Z",
+      "reset",
+      "confirmed",
+    );
+    const successCollection = {
+      ...insert(store, 1, 11),
+      redemptionAudit: success,
+    };
+    await notifications.handleCollection(successCollection);
+    await notifications.handleCollection(successCollection);
+
+    const restarted = new PushNotificationService(
+      store,
+      vapidConfiguration(),
+      () => pace("on_track"),
+      dependencies,
+    );
+    restarted.initializeBaseline();
+    await restarted.handleCollection(successCollection);
+
+    const failurePlan = store.planRedemption(
+      "credit-failure",
+      "request-failure",
+      "2026-09-01T00:02:00.000Z",
+      "2026-09-01T00:03:00.000Z",
+    );
+    const failure = store.finishRedemption(
+      failurePlan.id,
+      "final",
+      "2026-09-01T00:03:00.000Z",
+      "expired_unresolved",
+      "expired without confirmation",
+    );
+    await restarted.handleCollection({
+      ...insert(store, 2, 12),
+      redemptionAudit: failure,
+    });
+
+    expect(delivered).toEqual([
+      {
+        payload: { type: "redemption", result: "success", outcome: "reset" },
+        cursor: success.id,
+      },
+      {
+        payload: {
+          type: "redemption",
+          result: "failure",
+          outcome: "expired_unresolved",
+        },
+        cursor: failure.id,
+      },
+    ]);
+
+    const historical = browserSubscription("historical");
+    restarted.subscribe(historical);
+    await restarted.handleCollection({
+      ...insert(store, 3, 13),
+      redemptionAudit: failure,
+    });
+    expect(delivered).toHaveLength(2);
+    store.close();
+  });
 });
 
 describe("Web Push database migration", () => {
@@ -455,7 +549,12 @@ describe("Web Push database migration", () => {
       CREATE TABLE observations (id INTEGER PRIMARY KEY AUTOINCREMENT);
       INSERT INTO observations DEFAULT VALUES;
       CREATE TABLE redemption_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        credit_id TEXT NOT NULL UNIQUE,
+        redeem_request_id TEXT NOT NULL UNIQUE,
         state TEXT NOT NULL,
+        planned_at TEXT NOT NULL,
+        attempted_at TEXT,
         finalized_at TEXT,
         outcome TEXT,
         reason TEXT
@@ -494,6 +593,7 @@ describe("Web Push database migration", () => {
       remaining25Delivered: false,
       remaining15Delivered: false,
       remaining5Delivered: false,
+      lastRedemptionAuditId: 0,
       updatedAt: "2026-09-01T00:00:00.000Z",
     });
     store.deletePushSubscription(subscription.endpoint);

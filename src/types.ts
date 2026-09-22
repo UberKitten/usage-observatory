@@ -10,6 +10,7 @@ export type SourceState =
 export type PaceStatus = "unknown" | "room_to_spend" | "on_track" | "at_risk" | "exhausted";
 export type EventUncertainty = "low" | "medium" | "high";
 export type RedemptionAuditState = "planned" | "in_flight" | "final" | "ambiguous";
+export type RedemptionInitiator = "automatic" | "manual";
 export interface PushPreferences {
   overBudget: boolean;
   remaining25: boolean;
@@ -45,6 +46,7 @@ export interface PushNotificationState {
   remaining25Delivered: boolean;
   remaining15Delivered: boolean;
   remaining5Delivered: boolean;
+  lastRedemptionAuditId: number;
   updatedAt: string;
 }
 
@@ -52,7 +54,9 @@ export type PushNotificationPayload =
   | { type: "overBudget"; projectedPercent: number | null }
   | { type: "remaining"; thresholds: Array<25 | 15 | 5>; remainingPercent: number }
   | { type: "weeklyReset" }
-  | { type: "unscheduledReset" };
+  | { type: "unscheduledReset" }
+  | { type: "redemption"; result: "success" | "failure"; outcome: string }
+  | { type: "test" };
 
 
 export interface AccountSummary {
@@ -116,6 +120,7 @@ export interface RedemptionAudit {
   creditId: string;
   redeemRequestId: string;
   state: RedemptionAuditState;
+  initiator: RedemptionInitiator;
   plannedAt: string;
   attemptedAt: string | null;
   finalizedAt: string | null;
@@ -139,6 +144,7 @@ export interface BankedResetSummary {
   lastActionAt: string | null;
   reason: string;
   availableCount: number | null;
+  credits: Array<ResetCredit & { audit: RedemptionAudit | null }>;
   autoRedeemEnabled: boolean;
   audit: RedemptionAudit | null;
 }

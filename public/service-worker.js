@@ -37,6 +37,23 @@ self.addEventListener("push", (event) => {
     title = "Unscheduled usage reset";
     body = "Allowance reset earlier than scheduled.";
     tag = "usage-unscheduled-reset";
+  } else if (payload.type === "redemption") {
+    if (payload.result === "success") {
+      title = "Banked reset redeemed";
+      body = "OpenAI confirmed that the eligible Codex limit was reset.";
+    } else if (payload.result === "failure") {
+      title = "Banked reset not used";
+      body = payload.outcome === "expired_unresolved" || payload.outcome === "expired"
+        ? "The reset expired without a confirmed redemption."
+        : "Automatic redemption reached a final unsuccessful outcome.";
+    } else {
+      return;
+    }
+    tag = "usage-redemption";
+  } else if (payload.type === "test") {
+    title = "Usage Observatory test";
+    body = "Test notification delivered through the existing alert subscription.";
+    tag = "usage-observatory-test";
   } else {
     return;
   }

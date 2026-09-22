@@ -762,6 +762,146 @@ describe("saved-reset safety", () => {
     scenario.store.close();
   });
 
+  test("protects confirmed manual redemption, allows it outside the automatic window, and prevents replay", async () => {
+    const scenario = savedResetHarness(undefined, 48 * 3_600_000);
+    const consumeBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeBodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: false,
+    }));
+    const handler = createRequestHandler(scenario.store, collector, dirname(scenario.tokenPath));
+    const body = JSON.stringify({ creditId: scenario.credit.id });
+
+    const blocked = await handler(new Request(
+      "https://usage.example/api/reset-credits/redeem",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body },
+    ));
+    expect(blocked.status).toBe(403);
+    expect(consumeBodies).toHaveLength(0);
+
+    const redeemed = await handler(new Request(
+      "https://usage.example/api/reset-credits/redeem",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://usage.example",
+        },
+        body,
+      },
+    ));
+    expect(redeemed.status).toBe(200);
+    const result = await redeemed.json();
+    expect(result.status).toBe("success");
+    expect(result.audit.initiator).toBe("manual");
+    expect(consumeBodies).toEqual([
+      expect.objectContaining({ credit_id: scenario.credit.id }),
+    ]);
+
+    const duplicate = await handler(new Request(
+      "https://usage.example/api/reset-credits/redeem",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://usage.example",
+        },
+        body,
+      },
+    ));
+    expect(duplicate.status).toBe(409);
+    expect(consumeBodies).toHaveLength(1);
+    scenario.store.close();
+  });
+
+  test("serializes a manual request against the automatic scheduler and spends at most once", async () => {
+    const scenario = savedResetHarness();
+    let status = "available";
+    let consumeCalls = 0;
+    let releaseConsume!: () => void;
+    let markConsumeStarted!: () => void;
+    const consumeStarted = new Promise<void>((resolve) => {
+      markConsumeStarted = resolve;
+    });
+    const consumeRelease = new Promise<void>((resolve) => {
+      releaseConsume = resolve;
+    });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        markConsumeStarted();
+        await consumeRelease;
+        status = "redeemed";
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({
+          available_count: status === "available" ? 1 : 0,
+          credits: [{ ...scenario.credit, status }],
+        });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const operations = [
+      collector.collect(),
+      collector.redeemCreditManually(scenario.credit.id),
+    ] as const;
+    await consumeStarted;
+    releaseConsume();
+    const [automatic, manual] = await Promise.allSettled(operations);
+    expect(automatic.status).toBe("fulfilled");
+    expect(["fulfilled", "rejected"]).toContain(manual.status);
+    expect(consumeCalls).toBe(1);
+    expect(scenario.store.getLatestAudit()?.outcome).toBe("reset");
+    scenario.store.close();
+  });
+
+  test("refuses a manual request at exact expiry without sending consume", async () => {
+    const scenario = savedResetHarness(undefined, 0);
+    let consumeCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeCalls += 1;
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: 1, credits: [scenario.credit] });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: false,
+    }));
+
+    await expect(collector.redeemCreditManually(scenario.credit.id)).rejects.toThrow(
+      "expired",
+    );
+    expect(consumeCalls).toBe(0);
+    scenario.store.close();
+  });
+
   test("waits one polling interval before replaying a crash-interrupted request", async () => {
     const scenario = savedResetHarness();
     const expiry = scenario.credit.expires_at;

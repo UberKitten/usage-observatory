@@ -92,6 +92,15 @@ class CollectorFailure extends Error {
     this.state = state;
   }
 }
+export class ManualRedemptionError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ManualRedemptionError";
+  }
+}
 
 export function loadCollectorConfig(env: NodeJS.ProcessEnv = process.env): CollectorConfig {
   const modeValue = env.USAGE_SOURCE_MODE?.trim() || "command";
@@ -128,6 +137,7 @@ export class UsageCollector {
   private running = false;
   private nextAttemptAt: string | null = null;
   private readonly collectionListeners = new Set<CollectionListener>();
+  private redemptionQueue: Promise<void> = Promise.resolve();
 
 
   constructor(store: DatabaseStore, config = loadCollectorConfig()) {
@@ -259,7 +269,9 @@ export class UsageCollector {
         listing.supported &&
         listing.known
       ) {
-        const redemption = await this.tryAutomaticRedemption(parsed, listing.credits, auth);
+        const redemption = await this.withRedemptionLock(() =>
+          this.tryAutomaticRedemption(parsed, listing.credits, auth),
+        );
         parsed = redemption.parsed;
         listing = redemption.listing;
         redemptionAudit = redemption.audit;
@@ -315,6 +327,90 @@ export class UsageCollector {
         nextAttemptAt: this.nextAttemptAt,
         redemptionAudit: null,
       };
+    }
+  }
+
+  async redeemCreditManually(creditId: string): Promise<RedemptionAudit> {
+    if (this.config.mode !== "live") {
+      throw new ManualRedemptionError(503, "Manual redemption requires live token-file transport.");
+    }
+    if (creditId !== creditId.trim() || creditId.length === 0 || creditId.length > 512) {
+      throw new ManualRedemptionError(400, "A valid reset credit is required.");
+    }
+
+    return this.withRedemptionLock(async () => {
+      const auth = await this.readLiveAuth();
+      const listing = await this.fetchResetCreditListing(auth);
+      if (!listing.supported || !listing.known) {
+        throw new ManualRedemptionError(503, "A fresh reset-credit listing is unavailable.");
+      }
+      const credit = listing.credits.find(
+        (item) => item.id === creditId && item.status === "available",
+      );
+      if (!credit) {
+        throw new ManualRedemptionError(
+          409,
+          "The selected reset credit is no longer listed as available; no consume request was sent.",
+        );
+      }
+
+      const parsed = await this.fetchLiveUsage(auth);
+      const now = new Date();
+      const eligibility = this.checkRedemptionEligibility(parsed.payload, credit, now, false);
+      if (!eligibility.eligible) {
+        throw new ManualRedemptionError(409, `${eligibility.reason} No consume request was sent.`);
+      }
+
+      const existing = this.store.getAuditByCreditId(credit.id);
+      if (
+        existing?.state === "final" &&
+        (existing.outcome === "reset" || existing.outcome === "already_redeemed")
+      ) {
+        throw new ManualRedemptionError(
+          409,
+          "The provider already confirmed this reset credit as redeemed; no duplicate request was sent.",
+        );
+      }
+      let planned: RedemptionAudit;
+      if (existing && existing.state !== "final") {
+        if (existing.state === "in_flight") {
+          throw new ManualRedemptionError(
+            409,
+            "A redemption request is already in flight for this credit.",
+          );
+        }
+        const retryAt = Date.parse(existing.nextRetryAt ?? "");
+        if (Number.isFinite(retryAt) && retryAt > now.getTime()) {
+          throw new ManualRedemptionError(
+            409,
+            `A prior request is still waiting for safe reconciliation until ${existing.nextRetryAt}.`,
+          );
+        }
+        planned = existing;
+      } else {
+        planned = this.store.planRedemption(
+          credit.id,
+          crypto.randomUUID(),
+          now.toISOString(),
+          credit.expiresAt!,
+          "manual",
+        );
+      }
+      return this.consumeCredit(planned, auth, credit);
+    });
+  }
+
+  private async withRedemptionLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.redemptionQueue;
+    let release!: () => void;
+    this.redemptionQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 
@@ -491,6 +587,7 @@ export class UsageCollector {
     payload: NormalizedUsagePayload,
     credit: ResetCredit,
     now: Date,
+    enforceAutomaticHorizon = true,
   ): { eligible: boolean; reason: string } {
     if (credit.status !== "available") {
       return { eligible: false, reason: "The reset credit is not listed as available." };
@@ -502,7 +599,10 @@ export class UsageCollector {
     if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
       return { eligible: false, reason: "The reset credit is expired or its expiry is invalid." };
     }
-    if (expiresAt - now.getTime() > this.config.autoRedeemHorizonHours * 3_600_000) {
+    if (
+      enforceAutomaticHorizon &&
+      expiresAt - now.getTime() > this.config.autoRedeemHorizonHours * 3_600_000
+    ) {
       return {
         eligible: false,
         reason: `The reset credit expires outside the ${this.config.autoRedeemHorizonHours}-hour salvage horizon.`,

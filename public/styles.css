@@ -822,6 +822,116 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
   text-align: right;
 }
 
+.bank-card {
+  display: block;
+}
+
+.bank-heading,
+.bank-credit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+}
+
+.bank-heading > span {
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.bank-heading > strong {
+  font-size: 0.88rem;
+}
+
+.bank-list {
+  margin-top: 0.65rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.bank-credit {
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--line);
+}
+
+.bank-credit-copy {
+  min-width: 0;
+  display: grid;
+  gap: 0.12rem;
+}
+
+.bank-credit-copy strong {
+  text-align: left;
+  font-size: 0.76rem;
+}
+
+.bank-credit-copy time,
+.bank-credit-status,
+.bank-feedback {
+  color: var(--muted-strong);
+  font-size: 0.65rem;
+}
+
+.bank-credit-status,
+.bank-feedback {
+  margin: 0;
+}
+
+.bank-redeem {
+  min-height: 2rem;
+  padding: 0.4rem 0.68rem;
+}
+
+.secondary-button:disabled,
+.primary-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.primary-button {
+  min-height: 2.35rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid rgba(189, 152, 255, 0.72);
+  border-radius: 0.65rem;
+  color: #140a22;
+  background: var(--purple-bright);
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.redeem-dialog {
+  width: min(calc(100% - 2rem), 27rem);
+  padding: 1.15rem;
+  color: var(--ink);
+  background: #160d22;
+}
+
+.redeem-dialog::backdrop {
+  background: rgba(5, 2, 10, 0.76);
+}
+
+.redeem-dialog h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.redeem-dialog p {
+  margin: 0.65rem 0 0;
+  color: var(--muted-strong);
+  font-size: 0.75rem;
+  line-height: 1.55;
+}
+
+.dialog-actions {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.55rem;
+}
+
 .push-toggle {
   margin-top: 0.75rem;
   white-space: nowrap;
@@ -954,6 +1064,10 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .bank-card {
+    grid-column: 1 / -1;
+  }
+
   .alert-options {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -1001,6 +1115,14 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
 @media (max-width: 410px) {
   .graph-axis-label {
     font-size: 18px;
+  }
+
+  .bank-credit {
+    grid-template-columns: 1fr;
+  }
+
+  .bank-redeem {
+    width: 100%;
   }
 
 }

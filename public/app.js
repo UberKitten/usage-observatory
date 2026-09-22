@@ -50,7 +50,12 @@
       weeklyReset: false,
       unscheduledReset: false
     },
-    pushBusy: false
+    pushBusy: false,
+    redeemBusy: null,
+    redeemSelected: null,
+    redeemWaiting: null,
+    redeemedCredit: null,
+    redeemFeedback: null
   };
 
   const elements = {};
@@ -64,7 +69,8 @@
     "history-empty", "history-error", "retry-history", "weekly-wrap",
     "weekly-loading", "weekly-chart", "weekly-svg-description", "weekly-grid", "weekly-series",
     "weekly-tooltip", "weekly-empty", "freshness-card", "freshness-value",
-    "freshness-time", "bank-card", "bank-count", "bank-expiry", "resets-panel",
+    "freshness-time", "bank-card", "bank-count", "bank-list", "bank-feedback",
+    "redeem-dialog", "redeem-dialog-credit", "redeem-confirm", "resets-panel",
     "notable-events", "alerts-control", "push-preferences", "push-toggle"
   ];
   let liveSocket = null;
@@ -624,14 +630,20 @@
 
   function updateCountdowns() {
     const node = elements["reset-countdown"];
-    if (!node || node.hidden) return;
-    const countdown = formatCountdown(node.dataset.resetAt);
-    if (countdown === null) {
-      node.hidden = true;
-      return;
+    if (node && !node.hidden) {
+      const countdown = formatCountdown(node.dataset.resetAt);
+      if (countdown === null) {
+        node.hidden = true;
+      } else {
+        node.textContent = `Resets in ${countdown} · ${formatResetInstant(node.dataset.resetAt)}`;
+        node.setAttribute("aria-label", node.textContent);
+      }
     }
-    node.textContent = `Resets in ${countdown} · ${formatResetInstant(node.dataset.resetAt)}`;
-    node.setAttribute("aria-label", node.textContent);
+    for (const expiry of elements["bank-list"]?.querySelectorAll("time[data-bank-expiry]") || []) {
+      const relative = formatRelative(expiry.dataset.bankExpiry);
+      const instant = formatResetInstant(expiry.dataset.bankExpiry);
+      expiry.textContent = relative && instant ? `Expires ${instant} · ${relative}` : "";
+    }
   }
 
   function renderFreshness(dashboard) {
@@ -671,18 +683,120 @@
   function renderBank(dashboard) {
     const banked = dashboard?.bankedReset && typeof dashboard.bankedReset === "object" ? dashboard.bankedReset : null;
     const supported = banked?.supported === true;
-    const count = finiteNumber(banked?.availableCount);
-    const expiry = timestamp(banked?.expiresAt);
-    elements["bank-card"].hidden = !supported || (count === null && expiry === null);
-    elements["bank-count"].hidden = count === null;
-    elements["bank-count"].textContent = count === null ? "" : `${Math.max(0, Math.round(count))} available`;
-    elements["bank-expiry"].hidden = expiry === null;
-    if (expiry !== null) {
-      elements["bank-expiry"].dateTime = new Date(expiry).toISOString();
-      elements["bank-expiry"].textContent = `Earliest expiry ${formatInstant(expiry)}`;
-    } else {
-      elements["bank-expiry"].removeAttribute("datetime");
-      elements["bank-expiry"].textContent = "";
+    const suppliedCredits = Array.isArray(banked?.credits) ? banked.credits : [];
+    const credits = suppliedCredits
+      .filter((credit) => credit && credit.status === "available")
+      .filter((credit) => credit.id !== state.redeemedCredit)
+      .sort((left, right) => {
+        return (timestamp(left.expiresAt) ?? Number.POSITIVE_INFINITY) -
+          (timestamp(right.expiresAt) ?? Number.POSITIVE_INFINITY);
+      });
+    elements["bank-card"].hidden = !supported || credits.length === 0;
+    elements["bank-count"].textContent = `${credits.length} available`;
+
+    const rows = credits.map((credit, index) => {
+      const row = create("div", "bank-credit");
+      const copy = create("div", "bank-credit-copy");
+      const title = create("strong", "", `Reset ${index + 1}`);
+      const expiryTime = timestamp(credit.expiresAt);
+      const expiry = create("time");
+      if (expiryTime !== null) {
+        expiry.dateTime = new Date(expiryTime).toISOString();
+        expiry.dataset.bankExpiry = credit.expiresAt;
+      } else {
+        expiry.textContent = "Expiration unavailable";
+      }
+      const audit = credit.audit && typeof credit.audit === "object" ? credit.audit : null;
+      const status = create("p", "bank-credit-status");
+      if (audit?.state === "planned" || audit?.state === "ambiguous" || audit?.state === "in_flight") {
+        status.textContent = audit.state === "ambiguous" ? "Waiting for provider confirmation" : "Redemption pending";
+      } else if (audit?.state === "final" && audit.outcome && audit.outcome !== "reset" && audit.outcome !== "already_redeemed") {
+        status.textContent = "Last attempt did not use this reset";
+      } else {
+        status.textContent = "Available";
+      }
+      copy.append(title, expiry, status);
+
+      const button = create("button", "secondary-button bank-redeem", state.redeemBusy === credit.id ? "Redeeming…" : "Redeem");
+      button.type = "button";
+      button.dataset.creditId = credit.id;
+      if (expiryTime !== null) button.dataset.creditExpiry = credit.expiresAt;
+      button.disabled =
+        expiryTime === null ||
+        state.redeemBusy !== null ||
+        state.redeemWaiting === credit.id ||
+        audit?.state === "planned" ||
+        audit?.state === "ambiguous" ||
+        audit?.state === "in_flight";
+      button.setAttribute(
+        "aria-label",
+        expiryTime === null
+          ? "Banked reset cannot be redeemed without an exact expiration"
+          : `Redeem banked reset expiring ${formatInstant(credit.expiresAt)}`,
+      );
+      row.append(copy, button);
+      return row;
+    });
+    replaceChildren(elements["bank-list"], rows);
+    elements["bank-feedback"].hidden = !state.redeemFeedback;
+    elements["bank-feedback"].textContent = state.redeemFeedback || "";
+    updateCountdowns();
+  }
+
+  function openRedeemDialog(button) {
+    const creditId = nonempty(button.dataset.creditId);
+    const expiresAt = timestamp(button.dataset.creditExpiry);
+    if (!creditId || expiresAt === null || state.redeemBusy !== null) return;
+    state.redeemSelected = { id: creditId, expiresAt: new Date(expiresAt).toISOString() };
+    elements["redeem-dialog-credit"].textContent =
+      `Reset expiring ${formatInstant(expiresAt)} (${formatRelative(expiresAt)}).`;
+    elements["redeem-dialog"].returnValue = "";
+    elements["redeem-dialog"].showModal();
+  }
+
+  async function redeemSelectedCredit() {
+    const selected = state.redeemSelected;
+    state.redeemSelected = null;
+    if (!selected || state.redeemBusy !== null) return;
+    state.redeemBusy = selected.id;
+    state.redeemFeedback = "Checking live eligibility…";
+    renderBank(state.dashboard);
+    try {
+      const response = await fetch("/api/reset-credits/redeem", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ creditId: selected.id })
+      });
+      const payload = await response.json();
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Invalid redemption response");
+      }
+      if (payload.status === "success") {
+        state.redeemedCredit = selected.id;
+        state.redeemWaiting = null;
+        state.redeemFeedback = "Reset redeemed.";
+      } else if (payload.status === "waiting") {
+        state.redeemWaiting = selected.id;
+        state.redeemFeedback = "Waiting for provider confirmation. No success is assumed.";
+      } else {
+        state.redeemWaiting = null;
+        state.redeemFeedback =
+          nonempty(payload.audit?.reason) || nonempty(payload.error) || "The reset was not redeemed.";
+      }
+    } catch (error) {
+      state.redeemWaiting = null;
+      state.redeemFeedback = error instanceof Error
+        ? `${error.message}. No success is assumed.`
+        : "Redemption failed. No success is assumed.";
+    } finally {
+      state.redeemBusy = null;
+      renderBank(state.dashboard);
+      requestFullRefresh();
     }
   }
 
@@ -1411,6 +1525,17 @@
     });
     elements["retry-history"].addEventListener("click", loadHistory);
     elements["push-toggle"].addEventListener("click", togglePush);
+    elements["bank-list"].addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-credit-id]");
+      if (button) openRedeemDialog(button);
+    });
+    elements["redeem-dialog"].addEventListener("close", () => {
+      if (elements["redeem-dialog"].returnValue === "redeem") {
+        void redeemSelectedCredit();
+      } else {
+        state.redeemSelected = null;
+      }
+    });
     elements["push-preferences"].addEventListener("change", changePushPreference);
     window.addEventListener("offline", () => {
       state.offline = true;

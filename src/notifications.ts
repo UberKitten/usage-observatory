@@ -315,6 +315,19 @@ export class PushNotificationService {
     this.store.deletePushSubscription(endpoint);
   }
 
+  async sendTestNotification(): Promise<{ subscriptions: number; accepted: number }> {
+    if (!this.configuration) throw new Error("Push notifications are not configured.");
+    const subscriptions = this.store.getPushSubscriptions();
+    const results = await Promise.all(
+      subscriptions.map((subscription) =>
+        this.sendAtMostTwice(subscription, { type: "test" })),
+    );
+    return {
+      subscriptions: subscriptions.length,
+      accepted: results.filter((accepted) => accepted).length,
+    };
+  }
+
   async handleCollection(result: CollectionResult): Promise<void> {
     if (!this.configuration || !result.ok || result.observationId === null) return;
     const cursor = this.store.getLatestObservationCursor();
@@ -358,6 +371,21 @@ export class PushNotificationService {
         updatedAt,
       };
       const payloads: PushNotificationPayload[] = [];
+      const redemption = result.redemptionAudit;
+      if (
+        redemption?.state === "final" &&
+        redemption.initiator === "automatic" &&
+        redemption.id > prior.lastRedemptionAuditId
+      ) {
+        next.lastRedemptionAuditId = redemption.id;
+        const success =
+          redemption.outcome === "reset" || redemption.outcome === "already_redeemed";
+        payloads.push({
+          type: "redemption",
+          result: success ? "success" : "failure",
+          outcome: redemption.outcome ?? "unknown",
+        });
+      }
       const enteredOverBudget =
         !gap &&
         SAFE_PACE_BASELINES[prior.paceStatus] === true &&
@@ -466,6 +494,7 @@ export class PushNotificationService {
       remaining25Delivered: remaining !== null && remaining <= 25,
       remaining15Delivered: remaining !== null && remaining <= 15,
       remaining5Delivered: remaining !== null && remaining <= 5,
+      lastRedemptionAuditId: this.store.getLatestAudit()?.id ?? 0,
       updatedAt,
     };
   }
@@ -486,28 +515,30 @@ export class PushNotificationService {
   private async sendAtMostTwice(
     subscription: StoredPushSubscription,
     payload: PushNotificationPayload,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const encoded = JSON.stringify(payload);
     try {
       await this.sendOnce(subscription, encoded, payload.type);
-      return;
+      return true;
     } catch (error) {
       const statusCode = pushStatusCode(error);
       if (statusCode === 404 || statusCode === 410) {
         this.store.deletePushSubscriptionIfUnchanged(subscription);
-        return;
+        return false;
       }
-      if (!isUnambiguousTransientStatus(statusCode)) return;
+      if (!isUnambiguousTransientStatus(statusCode)) return false;
     }
 
     await this.sleep(TRANSIENT_RETRY_DELAY_MILLISECONDS);
     try {
       await this.sendOnce(subscription, encoded, payload.type);
+      return true;
     } catch (error) {
       const statusCode = pushStatusCode(error);
       if (statusCode === 404 || statusCode === 410) {
         this.store.deletePushSubscriptionIfUnchanged(subscription);
       }
+      return false;
     }
   }
 
@@ -585,7 +616,9 @@ function notificationTopic(type: PushNotificationPayload["type"]): string {
   if (type === "overBudget") return "usage-over-budget";
   if (type === "remaining") return "usage-remaining";
   if (type === "weeklyReset") return "usage-weekly-reset";
-  return "usage-unscheduled-reset";
+  if (type === "unscheduledReset") return "usage-unscheduled-reset";
+  if (type === "redemption") return "usage-redemption";
+  return "usage-observatory-test";
 }
 
 export async function handlePushApiRequest(
@@ -646,13 +679,13 @@ export async function handlePushApiRequest(
   }
 }
 
-class BodyError extends Error {
+export class BodyError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
   }
 }
 
-async function readBoundedJson(request: Request): Promise<unknown> {
+export async function readBoundedJson(request: Request): Promise<unknown> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   if (contentType !== "application/json") throw new BodyError(415, "content type must be application/json");
   const suppliedLength = request.headers.get("content-length");
@@ -689,7 +722,7 @@ async function readBoundedJson(request: Request): Promise<unknown> {
   }
 }
 
-function sameOriginMutation(request: Request, url: URL): boolean {
+export function sameOriginMutation(request: Request, url: URL): boolean {
   const originHeader = request.headers.get("origin");
   if (!originHeader || originHeader === "null") return false;
   let suppliedOrigin: string;

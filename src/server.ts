@@ -2,11 +2,14 @@ import { timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, extname, resolve, sep } from "node:path";
 import { DatabaseStore } from "./db";
-import { UsageCollector, loadCollectorConfig } from "./collector";
+import { ManualRedemptionError, UsageCollector, loadCollectorConfig } from "./collector";
 import {
+  BodyError,
   PushNotificationService,
   handlePushApiRequest,
   loadVapidConfiguration,
+  readBoundedJson,
+  sameOriginMutation,
 } from "./notifications";
 import type {
   BankedResetSummary,
@@ -181,6 +184,59 @@ async function handleApiRequest(
 ): Promise<Response> {
   const pushResponse = await handlePushApiRequest(request, url, notifications);
   if (pushResponse) return pushResponse;
+  if (url.pathname === "/api/reset-credits/redeem") {
+    if (request.method !== "POST") return methodNotAllowed("POST");
+    if (!sameOriginMutation(request, url)) {
+      return jsonResponse({ error: "same-origin request required" }, false, 403);
+    }
+    let body: unknown;
+    try {
+      body = await readBoundedJson(request);
+    } catch (error) {
+      const status = error instanceof BodyError ? error.status : 400;
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : "invalid JSON body" },
+        false,
+        status,
+      );
+    }
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body) ||
+      !("creditId" in body) ||
+      Object.keys(body).length !== 1 ||
+      typeof body.creditId !== "string"
+    ) {
+      return jsonResponse({ error: "body must contain exactly one creditId string" }, false, 400);
+    }
+    const creditId = body.creditId;
+    try {
+      const audit = await collector.redeemCreditManually(creditId);
+      const success =
+        audit.state === "final" &&
+        (audit.outcome === "reset" || audit.outcome === "already_redeemed");
+      const waiting = audit.state === "planned" || audit.state === "ambiguous";
+      return jsonResponse(
+        {
+          status: success ? "success" : waiting ? "waiting" : "failure",
+          audit,
+        },
+        false,
+        success ? 200 : waiting ? 202 : 409,
+      );
+    } catch (error) {
+      if (error instanceof ManualRedemptionError) {
+        return jsonResponse({ error: error.message }, false, error.status);
+      }
+      return jsonResponse(
+        { error: "Manual redemption could not be completed safely; no success is assumed." },
+        false,
+        502,
+      );
+    }
+  }
+
   if (url.pathname === "/api/dashboard") {
     if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
     return jsonResponse(buildDashboard(store, collector), request.method === "HEAD");
@@ -428,6 +484,15 @@ function buildBankedReset(
     maximumAttempts: policy.maximumAttempts,
   };
   const lastActionAt = audit?.finalizedAt ?? audit?.attemptedAt ?? audit?.plannedAt ?? null;
+  const credits = store
+    .getResetCreditInventory()
+    .filter((credit) => {
+      if (credit.status !== "available") return false;
+      if (!credit.expiresAt) return true;
+      const expiresAt = Date.parse(credit.expiresAt);
+      return Number.isFinite(expiresAt) && expiresAt > Date.now();
+    })
+    .map((credit) => ({ ...credit, audit: store.getAuditByCreditId(credit.id) }));
 
   if (collector.config.mode !== "live") {
     return {
@@ -439,6 +504,7 @@ function buildBankedReset(
       reason:
         "This source can report reset credits but has no credentialed action transport; redemption is unavailable. No public redemption endpoint is exposed.",
       availableCount: observation?.resetCredits.availableCount ?? null,
+      credits,
       autoRedeemEnabled: policy.enabled,
       audit,
     };
@@ -453,6 +519,7 @@ function buildBankedReset(
       reason: audit.reason ?? "The latest durable redemption audit has no additional reason.",
       availableCount: observation?.resetCredits.availableCount ?? null,
       autoRedeemEnabled: policy.enabled,
+      credits,
       audit,
     };
   }
@@ -466,6 +533,7 @@ function buildBankedReset(
       reason: "The live reset-credit listing/action capability is unavailable or has not yet been observed.",
       availableCount: observation?.resetCredits.availableCount ?? null,
       autoRedeemEnabled: policy.enabled,
+      credits,
       audit: null,
     };
   }
@@ -479,6 +547,7 @@ function buildBankedReset(
       reason: "The latest live listing contains no available reset credits.",
       availableCount: 0,
       autoRedeemEnabled: policy.enabled,
+      credits,
       audit: null,
     };
   }
@@ -493,6 +562,7 @@ function buildBankedReset(
       ? `Automatic salvage starts on the first successful poll at or inside ${policy.expiryHorizonHours} hour before the exact posted expiry. Retry checks are no sooner than ${policy.retryIntervalSeconds} seconds apart, honor longer provider Retry-After values, stop after ${policy.maximumAttempts} attempts, and never run at or after expiry. Allowance consumption does not suppress an expiring-credit attempt.`
       : "Automatic redemption is disabled by default. Reset credits are observable, but no public redemption endpoint is exposed.",
     availableCount: observation.resetCredits.availableCount,
+    credits,
     autoRedeemEnabled: policy.enabled,
     audit: null,
   };

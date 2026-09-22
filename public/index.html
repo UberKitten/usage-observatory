@@ -142,10 +142,13 @@
           <strong id="freshness-value">Connecting…</strong>
           <time id="freshness-time" hidden></time>
         </article>
-        <article class="compact-card panel" id="bank-card" hidden>
-          <span>Banked resets</span>
-          <strong id="bank-count"></strong>
-          <time id="bank-expiry" hidden></time>
+        <article class="compact-card panel bank-card" id="bank-card" hidden>
+          <div class="bank-heading">
+            <span>Banked resets</span>
+            <strong id="bank-count"></strong>
+          </div>
+          <div class="bank-list" id="bank-list"></div>
+          <p class="bank-feedback" id="bank-feedback" role="status" aria-live="polite" hidden></p>
         </article>
         <details class="alerts-control panel" id="alerts-control">
           <summary>Alerts</summary>
@@ -166,8 +169,20 @@
         <div class="notable-events" id="notable-events" aria-live="polite"></div>
       </section>
 
+      <dialog class="redeem-dialog panel" id="redeem-dialog" aria-labelledby="redeem-dialog-title">
+        <form method="dialog">
+          <h2 id="redeem-dialog-title">Use banked reset?</h2>
+          <p id="redeem-dialog-credit"></p>
+          <p>OpenAI will consume it only if at least one current Codex usage window is eligible to reset.</p>
+          <div class="dialog-actions">
+            <button class="secondary-button" type="submit" value="cancel">Cancel</button>
+            <button class="primary-button" id="redeem-confirm" type="submit" value="redeem">Use reset</button>
+          </div>
+        </form>
+      </dialog>
+
     </main>
 
-    <script src="/app.js?v=reset-jitter-1" defer></script>
+    <script src="/app.js?v=banked-resets-1" defer></script>
   </body>
 </html>
