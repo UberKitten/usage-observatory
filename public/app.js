@@ -688,8 +688,13 @@
       .filter((credit) => credit && credit.status === "available")
       .filter((credit) => credit.id !== state.redeemedCredit)
       .sort((left, right) => {
-        return (timestamp(left.expiresAt) ?? Number.POSITIVE_INFINITY) -
+        const expiryOrder =
+          (timestamp(left.expiresAt) ?? Number.POSITIVE_INFINITY) -
           (timestamp(right.expiresAt) ?? Number.POSITIVE_INFINITY);
+        if (expiryOrder) return expiryOrder;
+        const leftId = String(left.id);
+        const rightId = String(right.id);
+        return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
       });
     elements["bank-card"].hidden = !supported || credits.length === 0;
     elements["bank-count"].textContent = `${credits.length} available`;
@@ -712,29 +717,31 @@
         status.textContent = audit.state === "ambiguous" ? "Waiting for provider confirmation" : "Redemption pending";
       } else if (audit?.state === "final" && audit.outcome && audit.outcome !== "reset" && audit.outcome !== "already_redeemed") {
         status.textContent = "Last attempt did not use this reset";
+      } else if (expiryTime === null) {
+        status.textContent = "Exact expiration required";
       } else {
-        status.textContent = "Available";
+        status.textContent = index === 0 ? "Available" : "Use the earlier reset first";
       }
       copy.append(title, expiry, status);
+      row.append(copy);
 
-      const button = create("button", "secondary-button bank-redeem", state.redeemBusy === credit.id ? "Redeeming…" : "Redeem");
-      button.type = "button";
-      button.dataset.creditId = credit.id;
-      if (expiryTime !== null) button.dataset.creditExpiry = credit.expiresAt;
-      button.disabled =
-        expiryTime === null ||
-        state.redeemBusy !== null ||
-        state.redeemWaiting === credit.id ||
-        audit?.state === "planned" ||
-        audit?.state === "ambiguous" ||
-        audit?.state === "in_flight";
-      button.setAttribute(
-        "aria-label",
-        expiryTime === null
-          ? "Banked reset cannot be redeemed without an exact expiration"
-          : `Redeem banked reset expiring ${formatInstant(credit.expiresAt)}`,
-      );
-      row.append(copy, button);
+      if (index === 0 && expiryTime !== null) {
+        const button = create("button", "secondary-button bank-redeem", state.redeemBusy === credit.id ? "Redeeming…" : "Redeem");
+        button.type = "button";
+        button.dataset.creditId = credit.id;
+        button.dataset.creditExpiry = credit.expiresAt;
+        button.disabled =
+          state.redeemBusy !== null ||
+          state.redeemWaiting === credit.id ||
+          audit?.state === "planned" ||
+          audit?.state === "ambiguous" ||
+          audit?.state === "in_flight";
+        button.setAttribute(
+          "aria-label",
+          `Redeem banked reset expiring ${formatInstant(credit.expiresAt)}`,
+        );
+        row.append(button);
+      }
       return row;
     });
     replaceChildren(elements["bank-list"], rows);

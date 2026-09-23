@@ -105,7 +105,7 @@ Preferences, per-cycle baselines, and delivery cursors are durable per subscript
 Automatic redemption is off by default. When enabled, the collector:
 
 1. requires a fresh live usage report no more than ten minutes old;
-2. live-lists credits and selects the available one with the earliest exact, parseable, timezone-aware `expires_at`;
+2. live-lists credits and selects the available one with the earliest exact, parseable, timezone-aware `expires_at` (credit ID breaks exact-expiry ties deterministically);
 3. starts attempting only at or inside the configured horizon before that authoritative instant, regardless of whether any regular or Spark allowance has been consumed;
 4. re-fetches both the credit listing and usage report immediately before each attempt;
 5. commits a durable credit-specific idempotency key before sending a consume request;
@@ -114,7 +114,7 @@ Automatic redemption is off by default. When enabled, the collector:
 8. retries transient or ambiguous outcomes no sooner than the larger of the normal collection interval (five minutes by default), 60 seconds, or `Retry-After`, with at most 12 attempts and never at or after expiry; and
 9. treats a confirmed `nothing_to_reset` as a safe eligibility delay, durably planning a new idempotency key for a later poll because the provider proved the prior request consumed nothing.
 
-If the provider omits or publishes an unparseable exact expiry, the conservative fallback is observation only: the credit remains visible where possible, but automatic redemption does not estimate a date or send a consume request. Polling means the first automatic attempt occurs on the first successful collection at or inside the one-hour window, not at the exact boundary second. A confirmed manual request names one currently listed credit and its exact expiry, rechecks the live listing and usage report, may operate outside the automatic horizon, and shares the same serialized audit/idempotency path with the scheduler. It never bypasses provider eligibility, expiry, `Retry-After`, or an uncertain in-flight result. This follows the provider's `redeem_request_id` idempotency contract while avoiding duplicate consumption. It never buys credits, enables auto-reload, changes a plan, or spends a reset merely for testing. The browser receives no operator token; the protected manual mutation additionally requires exact same-origin confirmation.
+If the provider omits or publishes an unparseable exact expiry, the conservative fallback is observation only: the credit remains visible where possible, but redemption does not estimate a date or send a consume request for it. Polling means the first automatic attempt occurs on the first successful collection at or inside the one-hour window, not at the exact boundary second. A confirmed manual request may operate outside the automatic horizon, but only for the first credit in the same authoritative expiry order. It rechecks the live listing and usage report, rejects a stale or later-credit selection without substituting another credit, and shares the same serialized audit/idempotency path with the scheduler. It never bypasses provider eligibility, expiry, `Retry-After`, or an uncertain in-flight result. This follows the provider's `redeem_request_id` contract rather than assuming an HTTP timeout means success.
 
 ## Data semantics and limitations
 
@@ -140,7 +140,7 @@ The dedicated login and rotation behavior follows the open-source Codex client's
 - `GET /api/push/config` — whether Web Push is configured and, only when enabled, the public VAPID key
 - `POST /api/push/subscriptions` — exact-same-origin opt-in/update with a validated browser subscription
 - `DELETE /api/push/subscriptions` — exact-same-origin opt-out for the calling browser's submitted endpoint
-- `POST /api/reset-credits/redeem` — exact-same-origin, confirmed manual redemption of one freshly listed credit; returns success only for a provider-confirmed reset
+- `POST /api/reset-credits/redeem` — exact-same-origin, confirmed manual redemption of the earliest-expiring freshly listed credit; rejects stale or later selections and returns success only for a provider-confirmed reset
 
 All API responses are `Cache-Control: no-store`. Static browser assets contain no account credential or server secret; HTML and the service worker are served with revalidation.
 

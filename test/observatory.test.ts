@@ -600,6 +600,104 @@ describe("saved-reset safety", () => {
     scenario.store.close();
   });
 
+  test("uses the earliest credit from the final authoritative automatic listing", async () => {
+    const scenario = savedResetHarness(undefined, 50 * 60_000);
+    const earlierCredit = {
+      id: "RateLimitResetCredit_earlier",
+      status: "available",
+      expires_at: new Date(scenario.now + 20 * 60_000).toISOString(),
+    };
+    let listingCalls = 0;
+    const consumeBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeBodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        listingCalls += 1;
+        const credits = listingCalls === 1
+          ? [scenario.credit]
+          : [scenario.credit, earlierCredit];
+        return Response.json({ available_count: credits.length, credits });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: true,
+    }));
+
+    const result = await collector.collect();
+    expect(result.redemptionAudit?.creditId).toBe(earlierCredit.id);
+    expect(result.redemptionAudit?.outcome).toBe("reset");
+    expect(consumeBodies).toEqual([
+      expect.objectContaining({ credit_id: earlierCredit.id }),
+    ]);
+    scenario.store.close();
+  });
+
+  test("rejects a stale later-credit endpoint request and redeems the authoritative earliest credit", async () => {
+    const scenario = savedResetHarness(undefined, 48 * 3_600_000);
+    const earlierCredit = {
+      id: "RateLimitResetCredit_earlier",
+      status: "available",
+      expires_at: new Date(scenario.now + 24 * 3_600_000).toISOString(),
+    };
+    const credits = [scenario.credit, earlierCredit];
+    const consumeBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/consume")) {
+        consumeBodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ status: "reset" });
+      }
+      if (url.endsWith("rate-limit-reset-credits")) {
+        return Response.json({ available_count: credits.length, credits });
+      }
+      return Response.json(scenario.usage);
+    }) as typeof fetch;
+    const collector = new UsageCollector(scenario.store, collectorConfig({
+      mode: "live",
+      tokenFile: scenario.tokenPath,
+      autoRedeem: false,
+    }));
+    const handler = createRequestHandler(scenario.store, collector, dirname(scenario.tokenPath));
+    const stale = await handler(new Request(
+      "https://usage.example/api/reset-credits/redeem",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://usage.example",
+        },
+        body: JSON.stringify({ creditId: scenario.credit.id }),
+      },
+    ));
+    expect(stale.status).toBe(409);
+    expect((await stale.json()).error).toContain("first in expiry order");
+    expect(consumeBodies).toHaveLength(0);
+
+    const redeemed = await handler(new Request(
+      "https://usage.example/api/reset-credits/redeem",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://usage.example",
+        },
+        body: JSON.stringify({ creditId: earlierCredit.id }),
+      },
+    ));
+    expect(redeemed.status).toBe(200);
+    expect(consumeBodies).toEqual([
+      expect.objectContaining({ credit_id: earlierCredit.id }),
+    ]);
+    scenario.store.close();
+  });
+
   test("retries a transient failure on the polling cadence with the same idempotency key", async () => {
     const scenario = savedResetHarness();
     const requestIds: string[] = [];
