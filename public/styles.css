@@ -453,7 +453,17 @@ body[data-pace="slow"] .usage-hero::after {
   z-index: 1;
 }
 
+.hero-current {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+}
+
 .remaining-readout {
+  min-width: 12rem;
   min-height: 3.4rem;
   display: flex;
   align-items: baseline;
@@ -474,11 +484,30 @@ body[data-pace="slow"] .usage-hero::after {
 }
 
 .reset-countdown {
-  margin: 0.65rem 0 0;
+  margin-left: auto;
+  display: grid;
+  justify-items: end;
+  flex: 0 0 auto;
   color: var(--purple-bright);
-  font-size: 0.88rem;
-  font-weight: 800;
   font-variant-numeric: tabular-nums;
+}
+
+.reset-countdown[hidden] {
+  display: none;
+}
+
+.reset-countdown span {
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.reset-countdown strong {
+  font-size: clamp(1.15rem, 4vw, 1.7rem);
+  line-height: 1.1;
+  letter-spacing: 0.02em;
 }
 
 

@@ -61,7 +61,7 @@
   const elements = {};
   const ids = [
     "starfield", "header-status", "header-status-text", "banner-stack",
-    "remaining-value", "remaining-label", "usage-title", "reset-countdown",
+    "remaining-value", "remaining-label", "usage-title", "reset-countdown", "reset-countdown-value",
     "pace-readout", "pace-icon", "pace-text", "pace-rate-item", "pace-rate",
     "pace-projection-item", "pace-projection",
     "range-picker", "history-key", "history-wrap", "history-loading", "history-chart",
@@ -165,16 +165,15 @@
   function formatCountdown(value) {
     const time = timestamp(value);
     if (time === null) return null;
-    const delta = Math.floor((time - Date.now()) / 1000);
-    if (delta <= 0) return "Reset reached";
+    const delta = Math.max(0, Math.ceil((time - Date.now()) / 1000));
     const days = Math.floor(delta / 86400);
     const hours = Math.floor((delta % 86400) / 3600);
     const minutes = Math.floor((delta % 3600) / 60);
-    return [
-      days ? `${days}d` : null,
-      `${String(hours).padStart(2, "0")}h`,
-      `${String(minutes).padStart(2, "0")}m`
-    ].filter(Boolean).join(" ");
+    const seconds = delta % 60;
+    const clock = [hours, minutes, seconds]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+    return days ? `${days}d ${clock}` : clock;
   }
 
   function formatSignedPercent(value) {
@@ -606,8 +605,10 @@
     elements["usage-title"].textContent = "Weekly usage";
 
     const resetTime = timestamp(windowData?.resetsAt);
+    const resetAt = resetTime === null ? "" : new Date(resetTime).toISOString();
     elements["reset-countdown"].hidden = resetTime === null;
-    elements["reset-countdown"].dataset.resetAt = resetTime === null ? "" : new Date(resetTime).toISOString();
+    elements["reset-countdown"].dataset.resetAt = resetAt;
+    elements["reset-countdown"].dateTime = resetAt;
 
     const pace = dashboard?.pace && typeof dashboard.pace === "object" ? dashboard.pace : {};
     const paceMode = canonicalPace(pace.status);
@@ -644,14 +645,25 @@
 
   function updateCountdowns() {
     const node = elements["reset-countdown"];
-    if (node && !node.hidden) {
-      const countdown = formatCountdown(node.dataset.resetAt);
-      if (countdown === null) {
-        node.hidden = true;
-      } else {
-        node.textContent = `Resets in ${countdown} · ${formatResetInstant(node.dataset.resetAt)}`;
-        node.setAttribute("aria-label", node.textContent);
+    const resetTime = timestamp(node?.dataset.resetAt);
+    if (node && resetTime === null) {
+      node.hidden = true;
+    } else if (node && resetTime <= Date.now()) {
+      node.hidden = true;
+      if (node.dataset.expiredResetAt !== node.dataset.resetAt) {
+        node.dataset.expiredResetAt = node.dataset.resetAt;
+        void requestFullRefresh();
       }
+    } else if (node) {
+      node.hidden = false;
+      node.dataset.expiredResetAt = "";
+      const countdown = formatCountdown(node.dataset.resetAt);
+      elements["reset-countdown-value"].textContent = countdown || "";
+      const instant = formatResetInstant(node.dataset.resetAt);
+      node.setAttribute(
+        "aria-label",
+        instant ? `Reset in ${countdown}. Scheduled ${instant}.` : `Reset in ${countdown}.`
+      );
     }
     for (const expiry of elements["bank-list"]?.querySelectorAll("time[data-bank-expiry]") || []) {
       const relative = formatRelative(expiry.dataset.bankExpiry);

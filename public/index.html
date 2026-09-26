@@ -8,7 +8,7 @@
     <meta name="description" content="OpenAI Codex subscription allowance history and weekly trajectory.">
     <title>Codex Usage Observatory</title>
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=alerts-summary-1">
+    <link rel="stylesheet" href="/styles.css?v=alerts-countdown-1">
   </head>
   <body data-pace="unknown">
     <a class="skip-link" href="#main-content">Skip to usage</a>
@@ -44,12 +44,17 @@
     <main id="main-content" tabindex="-1">
       <section class="usage-hero panel" aria-labelledby="usage-title">
         <div class="hero-primary">
-          <div class="remaining-readout">
-            <strong id="remaining-value">Loading usage…</strong>
-            <span id="remaining-label" hidden>remaining</span>
+          <div class="hero-current">
+            <div class="remaining-readout">
+              <strong id="remaining-value">Loading usage…</strong>
+              <span id="remaining-label" hidden>remaining</span>
+            </div>
+            <time class="reset-countdown" id="reset-countdown" hidden>
+              <span>Reset in</span>
+              <strong id="reset-countdown-value"></strong>
+            </time>
           </div>
           <h1 id="usage-title">Weekly usage</h1>
-          <p class="reset-countdown" id="reset-countdown" hidden></p>
         </div>
         <div class="pace-readout" id="pace-readout">
           <div class="pace-verdict" id="pace-verdict">
@@ -183,6 +188,6 @@
 
     </main>
 
-    <script src="/app.js?v=alerts-summary-1" defer></script>
+    <script src="/app.js?v=alerts-countdown-1" defer></script>
   </body>
 </html>
