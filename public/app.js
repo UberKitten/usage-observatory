@@ -71,7 +71,7 @@
     "weekly-tooltip", "weekly-empty", "freshness-card", "freshness-value",
     "freshness-time", "bank-card", "bank-count", "bank-list", "bank-feedback",
     "redeem-dialog", "redeem-dialog-credit", "redeem-confirm", "resets-panel",
-    "notable-events", "alerts-control", "push-preferences", "push-toggle"
+    "notable-events", "alerts-control", "alerts-summary", "push-preferences", "push-toggle"
   ];
   let liveSocket = null;
   let liveReconnectTimer = null;
@@ -293,11 +293,24 @@
     } catch {}
   }
 
+  function renderAlertSummary() {
+    if (!state.pushSubscription) {
+      elements["alerts-summary"].textContent = "Notifications disabled";
+      return;
+    }
+    const enabledCount = PUSH_PREFERENCE_KEYS
+      .filter((key) => state.pushPreferences[key])
+      .length;
+    elements["alerts-summary"].textContent =
+      `Notifications enabled · ${enabledCount}/${PUSH_PREFERENCE_KEYS.length} alerts enabled`;
+  }
+
   function renderPushPreferences() {
     for (const input of elements["push-preferences"].querySelectorAll("[data-push-preference]")) {
       input.checked = state.pushPreferences[input.dataset.pushPreference];
       input.disabled = state.pushBusy;
     }
+    renderAlertSummary();
   }
 
   function adoptPushPreferences(value) {
@@ -342,6 +355,7 @@
 
   function renderCurrentPushControl() {
     renderPushControl(state.pushSubscription ? "disable" : "enable");
+    renderAlertSummary();
   }
 
   function decodeVapidPublicKey(value) {

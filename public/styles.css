@@ -951,6 +951,15 @@ body[data-pace="steady"] .pace-verdict { color: var(--steady); }
   letter-spacing: 0.04em;
 }
 
+.alert-summary {
+  margin-left: 0.45rem;
+  color: var(--muted);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
 .alert-options {
   margin-top: 0.7rem;
   display: grid;

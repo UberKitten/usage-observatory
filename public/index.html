@@ -8,7 +8,7 @@
     <meta name="description" content="OpenAI Codex subscription allowance history and weekly trajectory.">
     <title>Codex Usage Observatory</title>
     <link rel="manifest" href="/manifest.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=card-layout-1">
+    <link rel="stylesheet" href="/styles.css?v=alerts-summary-1">
   </head>
   <body data-pace="unknown">
     <a class="skip-link" href="#main-content">Skip to usage</a>
@@ -151,7 +151,7 @@
           <p class="bank-feedback" id="bank-feedback" role="status" aria-live="polite" hidden></p>
         </article>
         <details class="alerts-control panel" id="alerts-control">
-          <summary>Alerts</summary>
+          <summary>Alerts <span class="alert-summary" id="alerts-summary">Notifications disabled</span></summary>
           <div class="alert-options" id="push-preferences">
             <label><input type="checkbox" data-push-preference="overBudget" checked> Over budget</label>
             <label><input type="checkbox" data-push-preference="remaining25"> 25% remaining</label>
@@ -183,6 +183,6 @@
 
     </main>
 
-    <script src="/app.js?v=banked-resets-1" defer></script>
+    <script src="/app.js?v=alerts-summary-1" defer></script>
   </body>
 </html>
