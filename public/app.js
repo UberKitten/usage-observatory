@@ -745,10 +745,9 @@
         status.textContent = "Last attempt did not use this reset";
       } else if (expiryTime === null) {
         status.textContent = "Exact expiration required";
-      } else {
-        status.textContent = index === 0 ? "Available" : "Use the earlier reset first";
       }
-      copy.append(title, expiry, status);
+      copy.append(title, expiry);
+      if (status.textContent) copy.append(status);
       row.append(copy);
 
       if (index === 0 && expiryTime !== null) {
